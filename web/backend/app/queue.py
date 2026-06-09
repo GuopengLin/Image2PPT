@@ -83,8 +83,26 @@ async def _process(job_id: str) -> None:
             raise RuntimeError("No source file found in upload dir")
         source = source_files[0] if len(source_files) == 1 else upload_dir
 
-        async def on_stage(cur: int, total: int) -> None:
-            job.progress_pct = min(95, int(cur / max(total, 1) * 100))
+        # The CLI streams two kinds of progress markers (see runner.py):
+        # `band` sets the [lo, hi] slice of the bar the current phase
+        # owns; `tick` reports fractional progress inside that slice.
+        # We keep progress_pct monotonic and below 100 — the final 100
+        # is set once the job actually finishes.
+        band = [0, 99]
+
+        def _advance(pct: float) -> None:
+            job.progress_pct = max(job.progress_pct, min(99, int(pct)))
+
+        async def on_band(lo: int, hi: int) -> None:
+            band[0], band[1] = lo, hi
+            _advance(lo)
+            db.commit()
+            await _notify(job)
+
+        async def on_tick(done: int, total: int) -> None:
+            lo, hi = band
+            frac = min(1.0, done / max(total, 1))
+            _advance(lo + (hi - lo) * frac)
             db.commit()
             await _notify(job)
 
@@ -104,7 +122,8 @@ async def _process(job_id: str) -> None:
             work_dir=Path(job.output_dir),
             upload_dir=Path(job.upload_dir),
             mode=job.mode,
-            on_stage=on_stage,
+            on_band=on_band,
+            on_tick=on_tick,
             on_page=on_page,
             on_line=on_line,
         )

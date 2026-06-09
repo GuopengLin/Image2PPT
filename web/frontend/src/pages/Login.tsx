@@ -6,7 +6,7 @@ import logoUrl from "../assets/logo.png";
 const REPO_URL = "https://github.com/GuopengLin/Image2PPT";
 
 export default function Login({ onLogin }: { onLogin: (me: Me) => void }) {
-  const [username, setUsername] = useState("admin");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -49,7 +49,6 @@ export default function Login({ onLogin }: { onLogin: (me: Me) => void }) {
             className="input"
             type="password"
             value={password}
-            placeholder="••••••••"
             onChange={(e) => setPassword(e.target.value)}
           />
         </label>

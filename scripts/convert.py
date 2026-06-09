@@ -181,6 +181,16 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+def band(lo: int, hi: int, label: str) -> None:
+    """Announce the progress-bar slice [lo, hi] the next phase owns.
+
+    Consumed by the web runner (see web/backend/app/runner.py); harmless
+    noise on a plain CLI run. Sub-scripts emit `[progress] tick d/t`
+    lines that fill the current band fractionally.
+    """
+    print(f"[progress] band {lo} {hi} {label}", flush=True)
+
+
 def main() -> int:
     args = parse_args()
     source = Path(args.source).expanduser()
@@ -197,6 +207,7 @@ def main() -> int:
         ]
         if args.pages:
             ingest_cmd += ["--pages", args.pages]
+        band(0, 20, "pdf-ingest")
         run(ingest_cmd)
         source_dir = work / "source"
     else:
@@ -255,10 +266,14 @@ def main() -> int:
 
     if pdf_mode:
         # PDF text layer is already exact; skip OCR + review-apply.
+        band(20, 99, "build")
         run(build_cmd)
     else:
+        band(0, 50, "ocr")
         run(prepare_cmd)
+        band(50, 55, "ocr-apply")
         run(apply_cmd)
+        band(55, 99, "build")
         run(build_cmd)
 
     print("\nDone.")

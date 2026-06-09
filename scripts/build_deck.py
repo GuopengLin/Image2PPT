@@ -212,8 +212,31 @@ def _auto_workers(n_pages: int) -> int:
     return max(1, min(cores, n_pages, 8))
 
 
+# --- Web-runner progress protocol (see web/backend/app/runner.py) ----
+# convert.py hands build_deck the bar's "build" band; we fill it with
+# `[progress] tick done/total` lines. The work is the per-page stage-1
+# loop (N pages) plus 7 fixed post-pipeline milestones — one per banner
+# after stage 1. Harmless noise on a plain CLI run.
+_tick_pages = 0    # N pages handled in stage 1
+_tick_total = 0    # N + 7 post-pipeline milestones (0 = disabled)
+_tick_banner = 0   # banners seen so far (#1 = stage-1 start)
+_POST_PIPELINE_MILESTONES = 7
+
+
+def _tick(done: int) -> None:
+    if _tick_total > 0:
+        print(f"[progress] tick {min(done, _tick_total)} {_tick_total}",
+              flush=True)
+
+
 def banner(title: str) -> None:
+    global _tick_banner
     print(f"\n=== {title} ===", flush=True)
+    _tick_banner += 1
+    # Banner #1 opens the per-page stage-1 loop (pages drive ticks);
+    # #2.. are the post-pipeline milestones filling the rest of the band.
+    if _tick_banner >= 2:
+        _tick(_tick_pages + (_tick_banner - 1))
 
 
 def main() -> int:
@@ -250,6 +273,10 @@ def main() -> int:
                 f"ERROR: no page_NN.ocr.json under {work / 'ocr'}\n"
             )
             return 1
+        global _tick_pages, _tick_total
+        _tick_pages = len(nums)
+        _tick_total = len(nums) + _POST_PIPELINE_MILESTONES
+        pages_done = 0
         workers = args.workers if args.workers > 0 else _auto_workers(len(nums))
         if workers > 1 and len(nums) > 1:
             print(f"  parallel: {workers} workers × {len(nums)} pages",
@@ -281,6 +308,8 @@ def main() -> int:
                     print(f"page {n}: text={r['text']:>3} "
                           f"image={r['image']:>3}{tables_note} "
                           f"({r['_elapsed']:.1f}s)", flush=True)
+                    pages_done += 1
+                    _tick(pages_done)
         else:
             for n in nums:
                 t = time.time()
@@ -302,6 +331,8 @@ def main() -> int:
                                if r.get("tables") else "")
                 print(f"page {n}: text={r['text']:>3} image={r['image']:>3}"
                       f"{tables_note} ({time.time() - t:.1f}s)", flush=True)
+                pages_done += 1
+                _tick(pages_done)
         print(f"  stage 1 done in {time.time() - ts:.1f}s", flush=True)
     else:
         banner("1/5  run_pipeline SKIPPED")

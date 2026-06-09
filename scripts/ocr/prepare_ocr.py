@@ -85,6 +85,15 @@ from render_annotated_review import render_annotated_page  # noqa: E402
 from shared.gpu import paddle_device  # noqa: E402
 
 
+def _tick(done: int, total: int) -> None:
+    """Emit fractional progress within the web runner's current band.
+
+    Harmless on a plain CLI run. The OCR phase is two per-page passes
+    (PaddleOCR then cross-verify), so `total` is 2× the page count.
+    """
+    print(f"[progress] tick {done} {max(total, 1)}", flush=True)
+
+
 REVIEW_INSTRUCTIONS = (
     "Each entry's `corrected_text` has been pre-filled with the 3-engine "
     "consensus suggestion. Open the matching "
@@ -146,22 +155,30 @@ def discover_pages(src_dir: Path, pages_arg: str | None) -> list[str]:
 
 
 def run_ocr_batch(ocr, pairs: list[tuple[Path, Path]],
-                  min_conf: float) -> list[int]:
+                  min_conf: float, on_page=None) -> list[int]:
     """Run PaddleOCR.predict on each (src, out_json) pair; return per-page
     item counts. The OCR model is reused across pages — this is where
     the warm-model speedup happens (~3 s startup, ~9 s/page recognition).
+
+    `on_page(done, total)`, if given, is called after each page so the
+    web runner can advance the progress bar during this slow pass.
     """
     counts = []
-    for img_path, out_path in pairs:
+    total = len(pairs)
+    for i, (img_path, out_path) in enumerate(pairs, 1):
         if not img_path.exists():
             print(f"  SKIP missing: {img_path}", file=sys.stderr)
             counts.append(0)
+            if on_page:
+                on_page(i, total)
             continue
         try:
             result = ocr.predict(str(img_path))
         except Exception as exc:
             print(f"  FAIL {img_path}: {exc}", file=sys.stderr)
             counts.append(0)
+            if on_page:
+                on_page(i, total)
             continue
         items = extract_items(result, min_conf)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +188,8 @@ def run_ocr_batch(ocr, pairs: list[tuple[Path, Path]],
         )
         counts.append(len(items))
         print(f"  {img_path.name} -> {len(items)} items", flush=True)
+        if on_page:
+            on_page(i, total)
     return counts
 
 
@@ -380,7 +399,13 @@ def main() -> int:
     )
     pairs = [(image_paths[n], ocr_dir / f"page_{n}.ocr.json")
              for n in nums]
-    counts = run_ocr_batch(ocr, pairs, args.min_conf)
+    # OCR phase = two per-page passes (this one + cross-verify below),
+    # so progress ticks run 0 → 2N over the whole prepare_ocr band.
+    tick_total = 2 * len(nums)
+    counts = run_ocr_batch(
+        ocr, pairs, args.min_conf,
+        on_page=lambda done, _total: _tick(done, tick_total),
+    )
     print(f"  PaddleOCR done in {time.time() - t0:.1f}s "
           f"({sum(counts)} total detections)", flush=True)
 
@@ -394,7 +419,9 @@ def main() -> int:
     total_tier = {"green": 0, "yellow": 0, "red": 0}
     total_rescue = {"attempted": 0, "upgraded": 0}
     review_entry_counts = []
-    for n in nums:
+    for idx, n in enumerate(nums, 1):
+        # Second per-page pass — fills the back half of the OCR band.
+        _tick(len(nums) + idx, tick_total)
         ocr_path = ocr_dir / f"page_{n}.ocr.json"
         image_path = image_paths[n]
         if not ocr_path.exists() or not image_path.exists():
