@@ -68,7 +68,6 @@ sys.path.insert(0, str(SCRIPTS_ROOT / "tables"))
 import erase_text as et
 import build_inventory as bi
 import inventory_to_layout as i2l
-import simple_layout as sl
 import _heuristics as heur
 import detect_tables as dt
 from shared.geometry import intersection_area as _box_intersection
@@ -885,25 +884,33 @@ def process_page(num: str, src_dir: Path, work: Path,
 
 
 def process_page_simple(num: str, src_dir: Path, work: Path) -> dict:
-    """Erase text only, then emit a minimal background+text-overlay layout.
+    """Text-only mode: full mode minus the icon/shape asset extraction.
 
-    Used by build_deck's `--mode text-only`. Skips inventory and
-    inventory_to_layout entirely. The cleaned PNG becomes a full-slide
-    background image; OCR items become editable text boxes on top.
+    Used by build_deck's `--mode text-only`. Runs the same
+    erase → build_inventory → inventory_to_layout chain as full mode, so
+    editable text keeps the identical color/bold/align styling. The only
+    divergence: inventory_to_layout emits the text-erased cleaned page as
+    one full-slide background image (icons/shapes baked in) instead of
+    extracting each visual as a separate, movable PNG/shape object.
+
+    Table detection and icon-review pre-passes are skipped — those exist
+    only to protect the icon/shape extraction this mode drops.
     """
     src_path = find_page_image(src_dir, num)
     ocr_path = work / "ocr" / f"page_{num}.ocr.json"
     clean_path = work / "inventory" / f"page_{num}.clean.png"
+    inv_path = work / "inventory" / f"page_{num}.inventory.json"
+    masks_dir = work / "inventory" / "masks" / f"page_{num}"
+    manifest_path = work / "manifests" / f"page_{num}.assets.json"
     layout_path = work / "layouts" / f"page_{num}.layout.json"
+    assets_dir = work / "assets" / f"page_{num}"
     debug_dir = work / "debug"
 
-    clean_path.parent.mkdir(parents=True, exist_ok=True)
-    layout_path.parent.mkdir(parents=True, exist_ok=True)
-    debug_dir.mkdir(parents=True, exist_ok=True)
+    for d in (clean_path.parent, masks_dir, assets_dir,
+              manifest_path.parent, layout_path.parent, debug_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
-    # erase_text reads OCR + source image and writes the cleaned PNG.
-    # No icon-review / table pre-passes in simple mode — those exist to
-    # protect downstream inventory/icon extraction, which we're skipping.
+    # ---- stage 1: erase_text → clean.png (text removed, icons intact) ----
     et.run(
         image=str(src_path),
         ocr=str(ocr_path),
@@ -911,23 +918,39 @@ def process_page_simple(num: str, src_dir: Path, work: Path) -> dict:
         debug_dir=str(debug_dir),
     )
 
-    src_img = cv2.imread(str(src_path))
-    if src_img is None:
-        raise RuntimeError(f"cannot read source image: {src_path}")
-    H, W = src_img.shape[:2]
-
-    # Path stored in the layout is relative to build_deck's assets_root
-    # (= the work-dir), so combine_layouts → build_pptx_from_layout
-    # resolves it back to <work>/inventory/page_NN.clean.png.
-    clean_rel = f"inventory/page_{num}.clean.png"
-    return sl.write_layout(
-        page_num=num,
-        source_width=W,
-        source_height=H,
-        clean_rel_path=clean_rel,
-        ocr_path=ocr_path,
-        out_layout_path=layout_path,
+    # ---- stage 2: build_inventory (we consume only its text items; the
+    #              detected image items are dropped by text-only layout) ----
+    bi.run(
+        clean=str(clean_path),
+        source=str(src_path),
+        ocr=str(ocr_path),
+        out=str(inv_path),
+        debug_dir=str(debug_dir),
+        masks_dir=str(masks_dir),
     )
+
+    # ---- stage 3: inventory_to_layout in text-only mode ----
+    # clean_rel is resolved by build_deck's assets_root (= the work-dir)
+    # back to <work>/inventory/page_NN.clean.png.
+    clean_rel = f"inventory/page_{num}.clean.png"
+    i2l.run(
+        inventory=str(inv_path),
+        source=str(src_path),
+        cleaned=str(clean_path),
+        asset_prefix=f"assets/page_{num}",
+        out_assets_dir=str(assets_dir),
+        out_manifest=str(manifest_path),
+        out_layout=str(layout_path),
+        text_only=True,
+        text_only_bg_rel=clean_rel,
+    )
+
+    try:
+        inv = json.loads(inv_path.read_text(encoding="utf-8"))
+        text_count = sum(1 for e in inv if e.get("type") == "text")
+    except (OSError, json.JSONDecodeError):
+        text_count = 0
+    return {"page": num, "text": text_count, "image": 1, "tables": 0}
 
 
 # =============================================================================

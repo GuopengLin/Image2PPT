@@ -254,12 +254,13 @@ def main() -> int:
     t_total = time.time()
     simple_mode = args.mode == "text-only"
     if simple_mode:
-        print("  mode: text-only (full-page background + editable text)")
+        print("  mode: text-only (text-erased background image + "
+              "editable text; no icon/shape extraction)")
 
     # ---- Stage 1: run_pipeline ----
     nums: list[str] = []
     if not args.skip_pipeline:
-        stage1_label = ("run_pipeline (erase only, simple layout)"
+        stage1_label = ("run_pipeline (erase + inventory + layout, text-only)"
                         if simple_mode
                         else "run_pipeline (erase + inventory + layout)")
         banner(f"1/5  {stage1_label}")
@@ -375,41 +376,37 @@ def main() -> int:
         return 0
 
     # ---- Stage 2b: structural text-slot classes ----
-    # In text-only mode the editable text is laid out from raw OCR
-    # bboxes with no structural grouping, so style-class clustering has
-    # nothing meaningful to merge — skip it.
-    if simple_mode:
-        banner("2b/5  classify_text_slots SKIPPED (text-only mode)")
-    else:
-        banner("2b/5  classify_text_slots")
-        ts = time.time()
-        slot_report = work / "debug" / "text_slot_classes.json"
-        r = subprocess.run(
-            [sys.executable,
-             str(SCRIPTS_ROOT / "deck" / "classify_text_slots.py"),
-             "--layout", str(combined_path),
-             "--out", str(slot_report),
-             "--apply",
-             "--min-group-size", "2",
-             "--min-apply-size", "3"],
-            check=True, capture_output=True, text=True,
-        )
-        if r.stdout.strip():
-            print(r.stdout.strip())
-        print(f"  -> {slot_report}")
-        print(f"  stage 2b done in {time.time() - ts:.1f}s", flush=True)
-        if _should_stop_after(args, "classify"):
-            print(f"\n--stop-after=classify: {slot_report}")
-            return 0
-        if not _interactive_gate(args, "classify", artifacts=[slot_report]):
-            return 0
+    # Both modes share the same inventory-derived text layout, so the
+    # style-class clustering (color/bold/align normalisation within a
+    # structural slot) applies identically — text-only is full mode minus
+    # the icon/shape extraction, not a separate text path.
+    banner("2b/5  classify_text_slots")
+    ts = time.time()
+    slot_report = work / "debug" / "text_slot_classes.json"
+    r = subprocess.run(
+        [sys.executable,
+         str(SCRIPTS_ROOT / "deck" / "classify_text_slots.py"),
+         "--layout", str(combined_path),
+         "--out", str(slot_report),
+         "--apply",
+         "--min-group-size", "2",
+         "--min-apply-size", "3"],
+        check=True, capture_output=True, text=True,
+    )
+    if r.stdout.strip():
+        print(r.stdout.strip())
+    print(f"  -> {slot_report}")
+    print(f"  stage 2b done in {time.time() - ts:.1f}s", flush=True)
+    if _should_stop_after(args, "classify"):
+        print(f"\n--stop-after=classify: {slot_report}")
+        return 0
+    if not _interactive_gate(args, "classify", artifacts=[slot_report]):
+        return 0
 
-    # In text-only mode the cleaned PNG already carries the
-    # original glyphs visually, so even if our overlay sizing is off
-    # by a few points it doesn't move ink underneath. Calibration is
-    # expensive (re-renders PPTX → PDF → PNG twice) and only refines
-    # things the user can't see — skip by default.
-    should_calibrate = False if simple_mode else (
+    # Text sits on a text-erased background in both modes, so overlay
+    # size/position errors are visible — calibrate uniformly. (Respects
+    # --skip-render / --skip-calibration the same way for both modes.)
+    should_calibrate = (
         (not args.skip_render)
         if args.calibrate_text is None else args.calibrate_text
     )

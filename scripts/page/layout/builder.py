@@ -75,6 +75,13 @@ class LayoutBuilder:
         self._enable_native_outline = ENABLE_NATIVE_OUTLINE_SHAPES
 
         self.args = args
+        # Text-only mode: emit editable text (with full color/bold/align
+        # styling, identical to full mode) over a single text-erased
+        # background image, and skip all icon/shape asset extraction.
+        # `text_only_bg_rel` is the background image path relative to the
+        # PPT builder's assets_root (the work-dir).
+        self.text_only_mode = bool(getattr(args, "text_only", False))
+        self.text_only_bg_rel = getattr(args, "text_only_bg_rel", None)
         self.inventory = json.loads(
             Path(args.inventory).read_text(encoding="utf-8"))
         self.source = cv2.imread(args.source)
@@ -710,6 +717,10 @@ class LayoutBuilder:
         for el in self.inventory:
             x1, y1, x2, y2 = el["bbox"]
             if el["type"] == "image":
+                # Text-only mode: every non-text visual is carried by the
+                # single background image, so skip per-icon asset extraction.
+                if self.text_only_mode:
+                    continue
                 self._emit_image_element(el, int(x1), int(y1),
                                          int(x2), int(y2))
             else:
@@ -720,15 +731,19 @@ class LayoutBuilder:
                     self.text_elements.append(record)
 
         self.text_elements = strip_leading_list_markers(self.text_elements)
-        self.image_elements.extend(
-            restore_ignored_bullet_marker_images(
-                self.text_elements, self.source,
-                self.asset_dir, self.args.asset_prefix)
-        )
+        if not self.text_only_mode:
+            # Bullet markers re-enter as separate image objects only in full
+            # mode; in text-only they are already baked into the background.
+            self.image_elements.extend(
+                restore_ignored_bullet_marker_images(
+                    self.text_elements, self.source,
+                    self.asset_dir, self.args.asset_prefix)
+            )
         # Size unification normalises font-size drift between
         # visually-identical labels (`1000亿元` vs `24.22%`).
         self.text_elements = unify_group_sizes(self.text_elements)
-        self.image_elements = topo_sort_by_containment(self.image_elements)
+        if not self.text_only_mode:
+            self.image_elements = topo_sort_by_containment(self.image_elements)
 
     def write(self) -> None:
         manifest = {
@@ -741,6 +756,23 @@ class LayoutBuilder:
             encoding="utf-8")
 
         h, w = self.source.shape[:2]
+        if self.text_only_mode:
+            # One full-slide background image (text erased, icons/shapes
+            # intact) renders first → behind all editable text.
+            bg = (
+                [{
+                    "type": "image", "name": "bg",
+                    "path": self.text_only_bg_rel,
+                    "box": [0, 0, int(w), int(h)],
+                    "role": "background",
+                }]
+                if self.text_only_bg_rel else []
+            )
+            elements = bg + self.text_elements
+        else:
+            elements = (self.shape_elements
+                        + self.image_elements
+                        + self.text_elements)
         layout = {
             "slide_size": {
                 "width_in": self.args.slide_width_in,
@@ -749,9 +781,7 @@ class LayoutBuilder:
             "source_width": w,
             "source_height": h,
             "background": estimate_canvas_hex(self.source),
-            "elements": (self.shape_elements
-                         + self.image_elements
-                         + self.text_elements),
+            "elements": elements,
         }
         Path(self.args.out_layout).parent.mkdir(parents=True, exist_ok=True)
         Path(self.args.out_layout).write_text(

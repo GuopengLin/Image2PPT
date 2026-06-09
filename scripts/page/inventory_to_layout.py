@@ -169,6 +169,14 @@ def parse_args() -> argparse.Namespace:
              "16:9 inputs get 13.333 × 7.5.",
     )
     parser.add_argument("--slide-height-in", type=float, default=7.5)
+    parser.add_argument(
+        "--text-only", action="store_true",
+        help="Emit editable text over a single text-erased background "
+             "image instead of extracting per-icon/shape assets.")
+    parser.add_argument(
+        "--text-only-bg-rel", default=None,
+        help="Background image path (relative to the PPT assets_root) "
+             "used as the single full-slide background in --text-only.")
     return parser.parse_args()
 
 
@@ -176,16 +184,23 @@ def run(*, inventory: str, source: str, cleaned: str,
         asset_prefix: str, out_assets_dir: str,
         out_manifest: str, out_layout: str,
         slide_width_in: float | None = None,
-        slide_height_in: float = 7.5) -> None:
+        slide_height_in: float = 7.5,
+        text_only: bool = False,
+        text_only_bg_rel: str | None = None) -> None:
     """Programmatic entry — see parse_args() for the CLI equivalent.
 
     Used by run_pipeline.process_page to skip subprocess overhead.
+
+    text_only: emit editable text (full styling) over a single
+    text-erased background image (`text_only_bg_rel`, relative to the PPT
+    builder's assets_root) instead of extracting per-icon/shape assets.
     """
     args = argparse.Namespace(
         inventory=inventory, source=source, cleaned=cleaned,
         asset_prefix=asset_prefix, out_assets_dir=out_assets_dir,
         out_manifest=out_manifest, out_layout=out_layout,
         slide_width_in=slide_width_in, slide_height_in=slide_height_in,
+        text_only=text_only, text_only_bg_rel=text_only_bg_rel,
     )
     _run(args)
 
