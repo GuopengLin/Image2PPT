@@ -48,7 +48,8 @@ def apply_size_unification(elements: list[dict[str, Any]],
     texts = [
         el for el in texts
         if el.get("size_source")
-        not in {"render_fit", "mixed_runs", "preview_calibrated"}
+        not in {"render_fit", "mixed_runs", "preview_calibrated",
+                "style_class"}
     ]
     if len(texts) < 2:
         return
@@ -187,10 +188,11 @@ def apply_title_centering(elements: list[dict[str, Any]],
     for el in elements:
         if (el.get("type") or "").lower() != "text":
             continue
-        # Position calibration has already measured rendered ink against
-        # the source image. Don't apply a heuristic re-centering pass
-        # after that or the closed-loop correction gets partially undone.
-        if el.get("position_source") == "preview_calibrated":
+        # Position calibration measured rendered ink against the source,
+        # and class snapping is the pipeline's final authority on
+        # positions. Don't re-center over either of them.
+        if el.get("position_source") in {"preview_calibrated",
+                                         "style_class"}:
             continue
         if len(str(el.get("text", "") or "")) > max_title_chars:
             continue

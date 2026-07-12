@@ -79,6 +79,30 @@ def apply_one(ocr_path: Path, review_path: Path, out_path: Path | None,
         if e.get("corrected_text") is None:
             skipped += 1
             continue
+        if e.get("dropped"):
+            # Rescued below-min-conf detection: it never existed in
+            # ocr.json, so a filled-in correction INSERTS a new item.
+            corrected = e["corrected_text"]
+            if not corrected:
+                skipped += 1
+                continue
+            bx1, by1, bx2, by2 = (int(v) for v in e["bbox"])
+            already = any(
+                int(it.get("x1", -1)) == bx1 and int(it.get("y1", -1)) == by1
+                and int(it.get("x2", -1)) == bx2
+                and int(it.get("y2", -1)) == by2
+                for it in out_data
+            )
+            if already:
+                skipped += 1
+                continue
+            out_data.append({
+                "text": corrected,
+                "x1": bx1, "y1": by1, "x2": bx2, "y2": by2,
+                "confidence": 1.0,
+            })
+            changed += 1
+            continue
         idx = e["idx"]
         if not (0 <= idx < len(out_data)):
             print(f"[ocr_review_apply] WARN: review idx {idx} out of range "

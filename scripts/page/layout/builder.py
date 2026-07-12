@@ -96,6 +96,15 @@ class LayoutBuilder:
         self.cleaned = cv2.imread(args.cleaned)
         if self.source is None or self.cleaned is None:
             raise SystemExit("Could not load images.")
+        # build_inventory publishes its icon-filled view as a sidecar
+        # (it no longer overwrites the clean image in place); asset
+        # crops must come from that view when it exists.
+        icon_filled_path = Path(args.cleaned).with_name(
+            f"{Path(args.cleaned).stem}.icon_filled.png")
+        if icon_filled_path.exists():
+            filled = cv2.imread(str(icon_filled_path))
+            if filled is not None and filled.shape == self.cleaned.shape:
+                self.cleaned = filled
 
         source_h_px, source_w_px = self.source.shape[:2]
         self.inpaint_scale = source_h_px / 720.0

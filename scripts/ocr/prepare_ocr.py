@@ -163,14 +163,32 @@ def run_ocr_batch(ocr, pairs: list[tuple[Path, Path]],
             print(f"  FAIL {img_path}: {exc}", file=sys.stderr)
             counts.append(0)
             continue
-        items = extract_items(result, min_conf)
+        all_items = extract_items(result, 0.0)
+        items = [it for it in all_items
+                 if float(it.get("confidence", 1.0)) >= min_conf]
+        # Detections below --min-conf are too unreliable to auto-place,
+        # but dropping them silently loses genuinely hard text. Persist
+        # them so the review packet can queue them as red entries for a
+        # human/agent rescue.
+        dropped = [it for it in all_items
+                   if float(it.get("confidence", 1.0)) < min_conf]
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(
             json.dumps(items, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        dropped_path = out_path.with_name(f"{out_path.stem}.dropped.json")
+        if dropped:
+            dropped_path.write_text(
+                json.dumps(dropped, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        elif dropped_path.exists():
+            dropped_path.unlink()
         counts.append(len(items))
-        print(f"  {img_path.name} -> {len(items)} items", flush=True)
+        dropped_note = f" (+{len(dropped)} below min-conf)" if dropped else ""
+        print(f"  {img_path.name} -> {len(items)} items{dropped_note}",
+              flush=True)
     return counts
 
 
@@ -284,6 +302,44 @@ def build_review_packet(ocr_path: Path, image_path: Path, *,
                 "suggested_text": xv.suggested_text,
                 "corrected_text": xv.suggested_text,
                 "notes": None,
+            })
+
+    # Detections that fell below --min-conf never made it into ocr.json.
+    # Queue them as red review entries (idx=-1, dropped=true) so a
+    # reviewer can rescue genuinely hard text; ocr_review_apply inserts
+    # a filled-in entry as a new OCR item.
+    dropped_path = ocr_path.with_name(f"{ocr_path.stem}.dropped.json")
+    if dropped_path.exists():
+        try:
+            dropped_items = json.loads(
+                dropped_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            dropped_items = []
+        dropped_items.sort(
+            key=lambda it: -float(it.get("confidence", 0.0)))
+        budget = max(0, max_entries - len(entries))
+        for item in dropped_items[:budget]:
+            tier_count["red"] += 1
+            entries.append({
+                "idx": -1,
+                "dropped": True,
+                "original_text": item.get("text", ""),
+                "confidence": float(item.get("confidence", 0.0)),
+                "bbox": [int(item["x1"]), int(item["y1"]),
+                         int(item["x2"]), int(item["y2"])],
+                "tier": "red",
+                "reason": "below_min_conf",
+                "candidates": {
+                    "paddle": {"text": item.get("text", ""),
+                               "conf": round(float(
+                                   item.get("confidence", 0.0)), 4)},
+                    "easyocr": {"text": "", "conf": 0.0},
+                    "tesseract": {"text": "", "conf": 0.0},
+                },
+                "suggested_text": item.get("text", ""),
+                "corrected_text": None,
+                "notes": "below --min-conf; fill corrected_text to "
+                         "rescue this detection",
             })
 
     review = {

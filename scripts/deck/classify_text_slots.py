@@ -604,6 +604,7 @@ def _apply_parent_column_alignment(
                 if abs(old_x - target_x) < 0.15:
                     continue
                 box[0] = target_x
+                el["position_source"] = "style_class"
                 _sync_text_box(texts[i])
                 moved.append({
                     "name": el.get("name"),
@@ -802,6 +803,7 @@ def _apply_table_column_geometry_alignment(
                 if abs(old_x - target_x) < 0.15:
                     continue
                 box[0] = target_x
+                el["position_source"] = "style_class"
                 el["style_table_column_x"] = {
                     "axis": "left",
                     "target": target_x,
@@ -1099,6 +1101,7 @@ def _apply_bullet_marker_priors(
             old_x = float(box[0])
             if abs(old_x - body_x) <= 34.0:
                 box[0] = round(body_x, 3)
+                el["position_source"] = "style_class"
                 _sync_text_box(item)
             y = float(box[1])
             h = float(box[3])
@@ -1217,6 +1220,7 @@ def _apply_class_position_priors(
             if abs(old_x - new_x) < 0.15:
                 continue
             box[0] = new_x
+            el["position_source"] = "style_class"
             el["style_class_position_x"] = {
                 "axis": x_axis,
                 "target": target_axis,
@@ -1296,6 +1300,7 @@ def _apply_class_position_priors(
             if abs(old_y - new_y) < 0.15:
                 continue
             box[1] = new_y
+            el["position_source"] = "style_class"
             el["style_class_position_y"] = {
                 "axis": y_axis,
                 "target": target_axis_y,
@@ -1346,6 +1351,7 @@ def _apply_class_position_priors(
             if abs(old_x - new_x) < 0.15:
                 continue
             box[0] = new_x
+            el["position_source"] = "style_class"
             el["style_class_position_x"] = {
                 "axis": "center",
                 "target": target_center,
@@ -1661,6 +1667,9 @@ def classify_slide(slide: dict[str, Any],
             ):
                 for i in members:
                     texts[i]["el"]["size"] = suggested_size
+                    # Stamp the true last writer so later guards keyed
+                    # on size_source don't act on a stale marker.
+                    texts[i]["el"]["size_source"] = "style_class"
                 applied_size = True
             if (
                 (force_apply or len(members) >= min_apply_size)

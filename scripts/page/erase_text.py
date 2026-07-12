@@ -88,6 +88,8 @@ from _heuristics import (  # noqa: E402 — sys.path arranged at runtime via sub
     is_in_logo_zone,
     is_likely_icon,
     preprocess_ocr,
+    s_area,
+    s_length,
     should_preserve_visual,
     split_icon_prefix,
     trim_ocr_bbox_off_trailing_visual,
@@ -97,7 +99,8 @@ from _heuristics import (  # noqa: E402 — sys.path arranged at runtime via sub
 
 def _filter_short_text_stroke_components(
         stroke: np.ndarray,
-        text: str) -> tuple[np.ndarray, list[dict]]:
+        text: str,
+        scale: float = 1.0) -> tuple[np.ndarray, list[dict]]:
     """Remove icon/card-border components accidentally caught by short OCR.
 
     PaddleOCR sometimes returns `16小时` with a clock icon inside the same
@@ -116,6 +119,18 @@ def _filter_short_text_stroke_components(
     if stroke.size == 0 or len(text) > 5:
         return stroke, []
     h, w = stroke.shape[:2]
+    # Pixel constants below were tuned at 720-tall sources; route them
+    # through the scale helpers so high-DPI inputs keep the same
+    # physical behaviour (digit strokes at 1440p exceed the raw 75 px
+    # icon cap and the rules silently stop firing).
+    big_area = s_area(100, scale)
+    small_area = s_area(80, scale)
+    dust_area = s_area(8, scale)
+    edge_px = max(3, int(round(s_length(5, scale))))
+    narrow_w = max(2, int(round(s_length(4, scale))))
+    icon_min_side = s_length(16, scale)
+    icon_max_side = s_length(75, scale)
+    near_px = max(3, int(round(s_length(4, scale))))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         stroke.astype(np.uint8) * 255, 8)
     if n <= 1:
@@ -132,7 +147,7 @@ def _filter_short_text_stroke_components(
     inner_max_h = 0
     for i in range(1, n):
         x, y, ww, hh, area = (int(v) for v in stats[i])
-        if area >= 100 and not (x <= 5 or x + ww >= w - 5):
+        if area >= big_area and not (x <= edge_px or x + ww >= w - edge_px):
             if hh > inner_max_h:
                 inner_max_h = hh
     has_digit = any(c.isdigit() for c in text)
@@ -161,14 +176,15 @@ def _filter_short_text_stroke_components(
     component_boxes: list[tuple[int, int, int, int, int, int]] = []
     for i in range(1, n):
         x, y, ww, hh, area = (int(v) for v in stats[i])
-        if area < 8:
+        if area < dust_area:
             removed[i] = True
             continue
         aspect = ww / max(1, hh)
         cx = x + ww / 2.0
-        touches_side = x <= 5 or x + ww >= w - 5
-        narrow_edge_rule = touches_side and ww <= 4 and hh >= 0.45 * h
-        tiny_edge_dust = touches_side and area < 80
+        touches_side = x <= edge_px or x + ww >= w - edge_px
+        narrow_edge_rule = (touches_side and ww <= narrow_w
+                            and hh >= 0.45 * h)
+        tiny_edge_dust = touches_side and area < small_area
         # If the text trails with digits AND the suspect sits at the right
         # edge, it's likely the trailing digit run — erase, don't preserve.
         # Mirror for leading-digit text and left edge. Together with the
@@ -200,9 +216,9 @@ def _filter_short_text_stroke_components(
             and not suspect_likely_digit
             and not suspect_text_sized
             and 0.65 <= aspect <= 1.55
-            and 16 <= min(ww, hh)
-            and max(ww, hh) <= 75
-            and area >= 100
+            and icon_min_side <= min(ww, hh)
+            and max(ww, hh) <= icon_max_side
+            and area >= big_area
             and (suspect_at_left or suspect_at_right)
         )
         # Gray-zone flag for LLM review: this component would have fired
@@ -216,9 +232,9 @@ def _filter_short_text_stroke_components(
             and not suspect_likely_digit
             and suspect_text_sized
             and 0.65 <= aspect <= 1.55
-            and 16 <= min(ww, hh)
-            and max(ww, hh) <= 75
-            and area >= 100
+            and icon_min_side <= min(ww, hh)
+            and max(ww, hh) <= icon_max_side
+            and area >= big_area
             and (suspect_at_left or suspect_at_right)
         )
         if narrow_edge_rule or tiny_edge_dust or square_edge_icon:
@@ -242,14 +258,14 @@ def _filter_short_text_stroke_components(
     # Once the main text run is known, drop tiny components floating well
     # outside it. This removes clock/chevron flecks while preserving dots
     # and antialias fragments inside numbers such as `20.26%`.
-    anchors = [b for b in component_boxes if b[4] >= 80]
+    anchors = [b for b in component_boxes if b[4] >= small_area]
     if anchors:
         ax1 = min(b[0] for b in anchors)
         ax2 = max(b[2] for b in anchors)
         for x1, _y1, x2, _y2, area, i in component_boxes:
-            if area >= 80:
+            if area >= small_area:
                 continue
-            if x2 < ax1 - 4 or x1 > ax2 + 4:
+            if x2 < ax1 - near_px or x1 > ax2 + near_px:
                 removed[i] = True
                 keep[i] = False
 
@@ -758,7 +774,7 @@ def erase_text(
         if is_short_text and not (has_guard and guard_box_count >= 2):
             stroke_before_filter = stroke.copy()
             stroke, review_records = _filter_short_text_stroke_components(
-                stroke, item_text)
+                stroke, item_text, scale)
             # Translate the local (per-region) review records into the
             # global picture, applying any agent overrides that cover
             # this OCR item's region. Each component is logged as a
@@ -997,6 +1013,14 @@ def run(*, image: str, ocr: str, out: str,
     cleaned, mask, decisions = erase_text(img, ocr_data, overrides=overrides)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(out, cleaned)
+    # Sidecar of every pixel the eraser painted. Downstream foreground
+    # detection treats these as background by definition — the eraser's
+    # fill colour and the detector's canvas estimate use different
+    # models, and their disagreement used to re-surface erased regions
+    # as phantom image elements.
+    erased_mask_path = Path(out).with_name(
+        f"{Path(out).stem}.erased_mask.png")
+    cv2.imwrite(str(erased_mask_path), mask)
 
     if icon_review_dump:
         _dump_icon_review_packet(img, decisions, Path(icon_review_dump),

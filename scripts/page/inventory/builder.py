@@ -121,6 +121,17 @@ class InventoryBuilder:
         self.text_only_path = clean_path.with_name(
             f"{clean_path.stem}.text_only.png")
         cv2.imwrite(str(self.text_only_path), self.cleaned)
+
+        # Pixels the text eraser painted are background by definition —
+        # without this, an eraser fill that disagrees with the corner
+        # canvas estimate re-surfaces as a phantom image element.
+        self.erased_suppress: np.ndarray | None = None
+        erased_mask_path = clean_path.with_name(
+            f"{clean_path.stem}.erased_mask.png")
+        if erased_mask_path.exists():
+            em = cv2.imread(str(erased_mask_path), cv2.IMREAD_GRAYSCALE)
+            if em is not None and em.shape == self.cleaned.shape[:2]:
+                self.erased_suppress = em > 0
         # Icon detection must run on the text-erased view, not the source.
         self.icon_probe = self.cleaned.copy()
 
@@ -133,7 +144,8 @@ class InventoryBuilder:
         ]
 
         self.components = self._detect_components(
-            self.cleaned, args.min_area, args.dilate)
+            self.cleaned, args.min_area, args.dilate,
+            suppress=self.erased_suppress)
 
         self.inventory: list[dict] = []
         self.visual_idx = 0
@@ -360,7 +372,10 @@ class InventoryBuilder:
                 self.cleaned):
             self._append_outline_record(x1, y1, x2, y2, outline_mask)
         for x1, y1, x2, y2, _area in self.components:
-            crop = self.cleaned[y1:y2, x1:x2]
+            # Split on the pristine snapshot: the _scan_*_inplace helpers
+            # mutate self.cleaned during this very loop, so a live crop
+            # would make the split depend on component iteration order.
+            crop = self.icon_probe[y1:y2, x1:x2]
             outline_mask = self._detect_outline_mask(
                 self.cleaned, x1, y1, x2, y2)
             if outline_mask is not None:
@@ -424,7 +439,8 @@ class InventoryBuilder:
         """
         min_area = s_area(20000, self.scale)
         min_side = s_length(120, self.scale)
-        page_fg = self._foreground_mask(self.cleaned, self.args.dilate) > 0
+        page_fg = self._foreground_mask(self.cleaned, self.args.dilate,
+                                        suppress=self.erased_suppress) > 0
         kept_records: list[tuple] = []
         new_card_boxes: list[tuple] = []
         dropped_boxes: list[tuple] = []
@@ -643,7 +659,8 @@ class InventoryBuilder:
         text_only = cv2.imread(str(self.text_only_path))
         if text_only is None:
             return
-        residual_mask = self._foreground_mask(text_only, self.args.dilate)
+        residual_mask = self._foreground_mask(text_only, self.args.dilate,
+                                              suppress=self.erased_suppress)
         all_bboxes = (
             [_box4(r) for r in self.foreground_records]
             + [_box4(r) for r in self.subicon_records]
@@ -784,8 +801,14 @@ class InventoryBuilder:
             json.dumps(self.inventory, ensure_ascii=False, indent=2),
             encoding="utf-8")
         # Persist the icon-filled cleaned image so the parent's asset crop
-        # comes out without embedded pictograms.
-        cv2.imwrite(self.args.clean, self.cleaned)
+        # comes out without embedded pictograms. Written as a sidecar —
+        # overwriting the --clean input made the stage non-idempotent
+        # (a re-run would treat the already-filled image as the
+        # text-erased view and corrupt the text_only snapshot).
+        clean_path = Path(self.args.clean)
+        icon_filled_path = clean_path.with_name(
+            f"{clean_path.stem}.icon_filled.png")
+        cv2.imwrite(str(icon_filled_path), self.cleaned)
         text_count = sum(1 for e in self.inventory if e["type"] == "text")
         img_count = sum(1 for e in self.inventory if e["type"] == "image")
         sub_count = sum(1 for e in self.inventory

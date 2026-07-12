@@ -86,13 +86,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _foreground_mask(cleaned: np.ndarray, dilate_size: int) -> np.ndarray:
+def _foreground_mask(cleaned: np.ndarray, dilate_size: int,
+                     suppress: np.ndarray | None = None) -> np.ndarray:
     """Foreground mask used by detect_components and conservative_split.
 
     Threshold: noticeably different from the corner-estimated canvas
     background plus a Canny edge layer that catches 1-px pale outlines.
     The old white-background test made every pixel of a dark slide look
     like foreground, merging the whole page into one flattened object.
+
+    `suppress` marks pixels painted by the text eraser: they are
+    background by definition, no matter how far the eraser's fill colour
+    sits from the canvas estimate.
     """
     gray = cv2.cvtColor(cleaned, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(cleaned, cv2.COLOR_BGR2HSV)
@@ -107,10 +112,19 @@ def _foreground_mask(cleaned: np.ndarray, dilate_size: int) -> np.ndarray:
     edges = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
     mask = cv2.bitwise_or(mask, edges)
     kernel = np.ones((dilate_size, dilate_size), np.uint8)
-    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    if suppress is not None and suppress.shape == mask.shape:
+        # Grow the suppression a little: the Canny layer marks the
+        # colour boundary just OUTSIDE the painted region, and that
+        # 1-2 px ring alone re-forms a phantom component.
+        grown = cv2.dilate(suppress.astype(np.uint8),
+                           np.ones((3, 3), np.uint8), iterations=2) > 0
+        mask[grown] = 0
+    return mask
 
 
-def detect_components(cleaned: np.ndarray, min_area: int, dilate_size: int) -> list[tuple]:
+def detect_components(cleaned: np.ndarray, min_area: int, dilate_size: int,
+                      suppress: np.ndarray | None = None) -> list[tuple]:
     """Detect ALL connected components. Returns components above noise floor.
 
     Even a whole-image-sized component is returned (not filtered) so that
@@ -123,7 +137,7 @@ def detect_components(cleaned: np.ndarray, min_area: int, dilate_size: int) -> l
     - Subtle line art (white-bg sketches with light strokes)
     - Saturated colored regions (bars, banners, icons)
     """
-    mask = _foreground_mask(cleaned, dilate_size)
+    mask = _foreground_mask(cleaned, dilate_size, suppress=suppress)
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     out = []
     for i in range(1, n):
