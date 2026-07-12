@@ -145,6 +145,11 @@ from layout.zorder import topo_sort_by_containment  # noqa: E402, F401
 
 ENABLE_NATIVE_OUTLINE_SHAPES = False
 
+# Emit confidently-fitted connector strokes as native PPT line elements
+# (editable endpoints/colour/width) instead of raster PNGs. Crops the
+# geometry fit can't explain keep the PNG fallback either way.
+ENABLE_NATIVE_CONNECTORS = True
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(

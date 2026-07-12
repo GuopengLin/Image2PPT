@@ -30,7 +30,7 @@ Nearly all text in the source image is restored as editable PPT text boxes, whil
 
 ## Example
 
-The image on the left is the input (a GPT-generated privacy-computing diagram); the image on the right is the `.pptx` rebuilt by DeckWeaver, rendered back to PNG via LibreOffice. Every text element is an editable text box, and the central MPC lock, the connectors, etc. are extracted as independent, movable PNG objects.
+The image on the left is the input (a GPT-generated privacy-computing diagram); the image on the right is the `.pptx` rebuilt by DeckWeaver, rendered back to PNG via LibreOffice. Every text element is an editable text box; straight/elbow/dashed/arrow connectors are rebuilt as native editable PPT lines, and graphics like the central MPC lock are extracted as independent, movable transparent PNG objects.
 
 <table>
   <tr>

@@ -341,7 +341,10 @@ class Builder:
             for p_idx, line_runs in enumerate(paragraph_runs):
                 p = tf.paragraphs[0] if p_idx == 0 else tf.add_paragraph()
                 p.alignment = align(el.get("align"))
-                p.line_spacing = float(el.get("line_spacing", 1.05))
+                # Keep the fallback in sync with the 1.0 the layout
+                # emitters write, so elements missing the field don't
+                # render 5% taller line boxes and drift vertically.
+                p.line_spacing = float(el.get("line_spacing", 1.0))
                 if p_idx == 0:
                     self.apply_paragraph_list_style(p, el, left, width)
                 if not line_runs:
@@ -370,7 +373,7 @@ class Builder:
             for idx, line in enumerate(lines):
                 p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
                 p.alignment = align(el.get("align"))
-                p.line_spacing = float(el.get("line_spacing", 1.05))
+                p.line_spacing = float(el.get("line_spacing", 1.0))
                 if idx == 0:
                     self.apply_paragraph_list_style(p, el, left, width)
                 run = p.add_run()
@@ -521,13 +524,57 @@ class Builder:
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = fill
 
-    def add_line(self, slide, el: dict[str, Any]) -> None:
-        if "points" in el:
-            x1, y1, x2, y2 = el["points"]
-        else:
+    @staticmethod
+    def _line_points(el: dict[str, Any]) -> list[tuple[float, float]]:
+        """Normalise the two accepted `points` encodings to vertex pairs.
+
+        Straight lines use the legacy flat `[x1, y1, x2, y2]`; polylines
+        (elbow connectors) use `[[x, y], ...]` with 2+ vertices.
+        """
+        pts = el.get("points")
+        if pts is None:
             left, top, width, height = el["box"]
-            x1, y1, x2, y2 = left, top, left + width, top + height
-        line = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, self.x(x1), self.y(y1), self.x(x2), self.y(y2))
+            return [(left, top), (left + width, top + height)]
+        if pts and isinstance(pts[0], (list, tuple)):
+            return [(float(p[0]), float(p[1])) for p in pts]
+        x1, y1, x2, y2 = (float(v) for v in pts)
+        return [(x1, y1), (x2, y2)]
+
+    @staticmethod
+    def _apply_line_arrows(shape, el: dict[str, Any]) -> None:
+        """Set head/tail arrowheads on a shape's outline via DrawingML."""
+        if not el.get("arrow_start") and not el.get("arrow_end"):
+            return
+        ln = shape.line._get_or_add_ln()
+        for flag, tag in (("arrow_start", "a:headEnd"),
+                          ("arrow_end", "a:tailEnd")):
+            if not el.get(flag):
+                continue
+            end = ln.find(qn(tag))
+            if end is None:
+                end = OxmlElement(tag)
+                ln.append(end)
+            end.set("type", "triangle")
+            end.set("w", "med")
+            end.set("len", "med")
+
+    def add_line(self, slide, el: dict[str, Any]) -> None:
+        points = self._line_points(el)
+        if len(points) > 2:
+            # Multi-segment (elbow) connector → open freeform polyline.
+            start_x, start_y = points[0]
+            builder = slide.shapes.build_freeform(
+                self.x(start_x), self.y(start_y), scale=1.0)
+            builder.add_line_segments(
+                [(self.x(px), self.y(py)) for px, py in points[1:]],
+                close=False)
+            line = builder.convert_to_shape()
+            line.fill.background()
+        else:
+            (x1, y1), (x2, y2) = points
+            line = slide.shapes.add_connector(
+                MSO_CONNECTOR.STRAIGHT,
+                self.x(x1), self.y(y1), self.x(x2), self.y(y2))
         line.name = el.get("name", "line")
         col = rgb(el.get("line", el.get("color", "#000000")))
         if col is not None:
@@ -536,6 +583,7 @@ class Builder:
         dash = dash_style(el.get("dash"))
         if dash:
             line.line.dash_style = dash
+        self._apply_line_arrows(line, el)
 
     def add_slide(self, spec: dict[str, Any]) -> None:
         self.set_slide_coordinate_space(spec)

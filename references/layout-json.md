@@ -88,7 +88,20 @@ Supported shapes include `rect`, `rounded_rect`, `oval`, `diamond`, `triangle`, 
 }
 ```
 
-Use native lines for separators and rules when they are simple. Use extracted images for complex gradient/ornamental lines.
+Use native lines for separators, rules, and diagram connectors when they are simple. Use extracted images for complex gradient/ornamental lines.
+
+`points` accepts two encodings:
+
+- Flat `[x1, y1, x2, y2]` — one straight segment (a PPT straight connector).
+- Nested `[[x, y], [x, y], ...]` with 2+ vertices — an open polyline (e.g. an elbow connector), emitted as a freeform shape with no fill.
+
+Optional fields:
+
+- `dash`: `"dash"`/`"dashed"` or `"dot"`/`"dotted"`.
+- `arrow_start` / `arrow_end`: `true` adds a triangle arrowhead at that end (`points` order defines which end is which).
+- `box`: `[x, y, w, h]` bbox of the points — include it on auto-extracted connectors so containment-based z-ordering can place the line above its background/card.
+
+The auto pipeline emits these for inventory `connector` components whose stroke geometry fits a straight or elbow model confidently (see `scripts/page/layout/connector_geometry.py`); anything else keeps the transparent-PNG fallback.
 
 ## Ordering
 

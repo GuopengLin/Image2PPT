@@ -33,8 +33,17 @@ from layout.grouping import unify_group_sizes  # noqa: E402
 from layout.icon_alpha import (  # noqa: E402
     _ICON_PAD_ROLES,
     _SPARSE_VISUAL_ROLES,
+    _border_is_uniform,
+    _decontaminate_edges,
+    _estimate_background_image,
     _line_art_alpha,
+    _line_art_matte,
     _scrub_text_boxes_from_icon_crop,
+    refine_masked_asset_edges,
+)
+from layout.connector_geometry import (  # noqa: E402
+    extract_connector_geometry,
+    merge_collinear_dash_runs,
 )
 from layout.lists import strip_leading_list_markers  # noqa: E402
 from layout.outline import (  # noqa: E402
@@ -69,14 +78,20 @@ class LayoutBuilder:
     """
 
     def __init__(self, args):
-        # `ENABLE_NATIVE_OUTLINE_SHAPES` lives on the facade because it
-        # is the single toggle that may be flipped externally for QA.
-        from inventory_to_layout import ENABLE_NATIVE_OUTLINE_SHAPES
+        # The feature toggles live on the facade because they are the
+        # switches that may be flipped externally for QA.
+        from inventory_to_layout import (
+            ENABLE_NATIVE_CONNECTORS,
+            ENABLE_NATIVE_OUTLINE_SHAPES,
+        )
         self._enable_native_outline = ENABLE_NATIVE_OUTLINE_SHAPES
+        self._enable_native_connectors = ENABLE_NATIVE_CONNECTORS
 
         self.args = args
         self.inventory = json.loads(
             Path(args.inventory).read_text(encoding="utf-8"))
+        if self._enable_native_connectors:
+            self.inventory = merge_collinear_dash_runs(self.inventory)
         self.source = cv2.imread(args.source)
         self.cleaned = cv2.imread(args.cleaned)
         if self.source is None or self.cleaned is None:
@@ -582,6 +597,10 @@ class LayoutBuilder:
                 self._emit_split_outline_rows(el, split_boxes,
                                               src_img, sparse_visual)
                 return
+        if (role == "connector" and self._enable_native_connectors
+                and self._try_emit_native_connector(el, crop,
+                                                    int(x1), int(y1))):
+            return
         if has_mask and not keep_outline_full_crop:
             if self._emit_masked_image(el, asset_name, mask_path, src_img,
                                        crop, contained_outline_boxes,
@@ -592,7 +611,8 @@ class LayoutBuilder:
             return
         self._emit_role_specific_crop(el, asset_name, crop,
                                       x1, y1, x2, y2,
-                                      scrub_icon_text)
+                                      scrub_icon_text,
+                                      try_matte=implicit_cv2_icon)
         self.manifest_assets.append({
             "name": asset_name,
             "box": [int(x1), int(y1), int(x2), int(y2)],
@@ -654,6 +674,7 @@ class LayoutBuilder:
             crop = _scrub_text_boxes_from_icon_crop(
                 crop, (int(x1), int(y1), int(x2), int(y2)),
                 self.text_boxes, alpha=alpha)
+        crop, alpha = refine_masked_asset_edges(crop, alpha)
         rgba = np.dstack([crop, alpha])
         cv2.imwrite(str(self.asset_dir / asset_name), rgba)
         self.manifest_assets.append({
@@ -668,10 +689,77 @@ class LayoutBuilder:
         })
         return True
 
+    def _try_emit_native_connector(self, el: dict, crop: np.ndarray,
+                                   x1: int, y1: int) -> bool:
+        """Emit a connector as a native PPT line when the fit is confident.
+
+        Returns True when a `type: "line"` element was appended (the
+        raster fallback must then be skipped). The element also carries
+        the bbox as `box` so containment z-ordering places it above the
+        background/cards it lies on.
+        """
+        _fg, alpha = _line_art_matte(crop)
+        geom = extract_connector_geometry(crop, alpha)
+        if geom is None:
+            return False
+        points = [[round(x1 + px, 1), round(y1 + py, 1)]
+                  for px, py in geom["points"]]
+        pxs = [p[0] for p in points]
+        pys = [p[1] for p in points]
+        width_pt = max(0.5, round(geom["width_px"] * self.pt_per_px, 2))
+        element = {
+            "type": "line",
+            "name": el["id"],
+            "points": points,
+            "box": [min(pxs), min(pys),
+                    max(1.0, max(pxs) - min(pxs)),
+                    max(1.0, max(pys) - min(pys))],
+            "line": geom["color"],
+            "line_width": width_pt,
+        }
+        if geom.get("dash"):
+            element["dash"] = geom["dash"]
+        if geom.get("arrow_start"):
+            element["arrow_start"] = True
+        if geom.get("arrow_end"):
+            element["arrow_end"] = True
+        # Goes into the image z-order machinery (not shape_elements) so
+        # topo_sort_by_containment keeps it above any containing asset.
+        self.image_elements.append(element)
+        return True
+
+    def _icon_matte_alpha(self, crop: np.ndarray) -> np.ndarray | None:
+        """Conservative auto-matte for small role-less icon crops.
+
+        These crops used to ship fully opaque, so the page background
+        baked into the rectangle shows as a colour block whenever the
+        slide/card fill underneath differs even slightly. Matte only
+        when the border ring is one flat colour and the recovered
+        foreground looks icon-like; otherwise keep the opaque emit.
+        """
+        h, w = crop.shape[:2]
+        if h * w == 0 or not _border_is_uniform(crop):
+            return None
+        fg, alpha = _line_art_matte(crop)
+        opaque = alpha > 16
+        frac = float(opaque.sum()) / float(h * w)
+        if not 0.005 <= frac <= 0.65:
+            return None
+        # The ring must really be background — a photo-like crop keeps
+        # content at the border and must stay opaque.
+        ring = np.zeros((h, w), dtype=bool)
+        r = max(1, min(2, min(h, w) // 10))
+        ring[:r, :] = ring[-r:, :] = ring[:, :r] = ring[:, -r:] = True
+        if float(alpha[ring].mean()) > 20.0:
+            return None
+        crop[:] = fg
+        return alpha
+
     def _emit_role_specific_crop(self, el: dict, asset_name: str,
                                  crop: np.ndarray,
                                  x1: int, y1: int, x2: int, y2: int,
-                                 scrub_icon_text: bool) -> None:
+                                 scrub_icon_text: bool,
+                                 try_matte: bool = False) -> None:
         role = el.get("role")
         if role == "subicon":
             # White icon on dark bg → keep only near-white pixels opaque,
@@ -681,13 +769,16 @@ class LayoutBuilder:
             alpha = np.clip((gray.astype(int) - 180) * 3,
                             0, 255).astype(np.uint8)
             alpha[hsv_[:, :, 1] > 60] = 0
+            if int((alpha > 24).sum()) >= 4:
+                bg_est = _estimate_background_image(crop, alpha > 24)
+                crop = _decontaminate_edges(crop, alpha, bg_est)
             crop = _scrub_text_boxes_from_icon_crop(
                 crop, (int(x1), int(y1), int(x2), int(y2)),
                 self.text_boxes, alpha=alpha)
             rgba = np.dstack([crop, alpha])
             cv2.imwrite(str(self.asset_dir / asset_name), rgba)
         elif role in {"badge_subicon", "connector", "line_subicon"}:
-            alpha = _line_art_alpha(crop)
+            crop, alpha = _line_art_matte(crop)
             if int((alpha > 16).sum()) < 4:
                 return
             crop = _scrub_text_boxes_from_icon_crop(
@@ -696,11 +787,16 @@ class LayoutBuilder:
             rgba = np.dstack([crop, alpha])
             cv2.imwrite(str(self.asset_dir / asset_name), rgba)
         else:
+            alpha = self._icon_matte_alpha(crop) if try_matte else None
             if scrub_icon_text:
                 crop = _scrub_text_boxes_from_icon_crop(
                     crop, (int(x1), int(y1), int(x2), int(y2)),
-                    self.text_boxes)
-            cv2.imwrite(str(self.asset_dir / asset_name), crop)
+                    self.text_boxes, alpha=alpha)
+            if alpha is not None:
+                cv2.imwrite(str(self.asset_dir / asset_name),
+                            np.dstack([crop, alpha]))
+            else:
+                cv2.imwrite(str(self.asset_dir / asset_name), crop)
 
     # ------------------------------------------------------------------
     # Build orchestration

@@ -137,17 +137,8 @@ def _simple_background_strip(source: np.ndarray,
     return bool(stable or light_neutral)
 
 
-def _line_art_alpha(crop_bgr: np.ndarray) -> np.ndarray:
-    """Alpha mask for sparse line icons without keeping rectangular bg.
-
-    The foreground can be a pure stroke icon, a white badge on a coloured
-    title bar, or a filled warning triangle with white holes. We preserve
-    filled foreground islands and their enclosed holes, but leave
-    ordinary surrounding panel/background pixels transparent.
-    """
+def _border_median_bgr(crop_bgr: np.ndarray) -> np.ndarray:
     h, w = crop_bgr.shape[:2]
-    if h == 0 or w == 0:
-        return np.zeros((h, w), dtype=np.uint8)
     ring = max(1, min(4, min(h, w) // 8))
     border = np.concatenate([
         crop_bgr[:ring, :].reshape(-1, 3),
@@ -155,22 +146,171 @@ def _line_art_alpha(crop_bgr: np.ndarray) -> np.ndarray:
         crop_bgr[:, :ring].reshape(-1, 3),
         crop_bgr[:, -ring:].reshape(-1, 3),
     ])
-    bg = (np.median(border, axis=0)
-          if len(border) else np.array([255, 255, 255]))
+    if not len(border):
+        return np.array([255.0, 255.0, 255.0])
+    return np.median(border, axis=0)
+
+
+def _border_is_uniform(crop_bgr: np.ndarray) -> bool:
+    """True when the border ring is one colour (flat-bg hypothesis holds)."""
+    h, w = crop_bgr.shape[:2]
+    ring = max(1, min(4, min(h, w) // 8))
+    border = np.concatenate([
+        crop_bgr[:ring, :].reshape(-1, 3),
+        crop_bgr[-ring:, :].reshape(-1, 3),
+        crop_bgr[:, :ring].reshape(-1, 3),
+        crop_bgr[:, -ring:].reshape(-1, 3),
+    ]).astype(np.int16)
+    if not len(border):
+        return True
+    med = np.median(border, axis=0)
+    spread = np.abs(border - med).max(axis=1)
+    return float(np.percentile(spread, 90)) <= 14.0
+
+
+def _estimate_background_image(crop_bgr: np.ndarray,
+                               fg_mask: np.ndarray) -> np.ndarray:
+    """Per-pixel background estimate underneath the foreground.
+
+    A single border-median colour breaks on gradient fills and on icons
+    that straddle a card edge (the ring straddles two colours and the
+    median matches neither). Inpainting the dilated foreground from its
+    surroundings gives every pixel a local background colour instead.
+    """
+    h, w = crop_bgr.shape[:2]
+    grow = cv2.dilate(fg_mask.astype(np.uint8),
+                      np.ones((3, 3), np.uint8), iterations=2)
+    covered = float(grow.sum()) / float(max(1, h * w))
+    if covered >= 0.90:
+        # Almost no background left to sample from — fall back to the
+        # flat border estimate.
+        flat = _border_median_bgr(crop_bgr)
+        return np.tile(flat.astype(np.float32), (h, w, 1))
+    bg = cv2.inpaint(crop_bgr, grow * 255, 3, cv2.INPAINT_TELEA)
+    # Smooth inpaint streaks; the mask is gone so this can't smear
+    # foreground colours back in.
+    k = 5 if min(h, w) >= 5 else max(1, min(h, w) // 2 * 2 + 1)
+    return cv2.blur(bg, (k, k)).astype(np.float32)
+
+
+def _local_foreground_seed(crop_bgr: np.ndarray) -> np.ndarray:
+    """Bg-hypothesis-free foreground seed for non-uniform backgrounds.
+
+    A wide median filter removes thin strokes but follows gradients, so
+    the residual highlights line art without assuming any global bg
+    colour. Canny edges add stroke/blob boundaries the residual may
+    miss.
+    """
+    h, w = crop_bgr.shape[:2]
+    k = min(15, max(9, (min(h, w) // 6) | 1))
+    if min(h, w) < 9:
+        k = max(3, (min(h, w) // 2) | 1)
+    bg_med = cv2.medianBlur(crop_bgr, k)
+    residual = np.abs(
+        crop_bgr.astype(np.int16) - bg_med.astype(np.int16)).max(axis=2)
+    seed = residual > 10
+    edges = cv2.Canny(crop_bgr, 40, 120) > 0
+    seed |= edges
+    return cv2.dilate(seed.astype(np.uint8),
+                      np.ones((3, 3), np.uint8), 1).astype(bool)
+
+
+def _decontaminate_edges(crop_bgr: np.ndarray, alpha: np.ndarray,
+                         bg_est: np.ndarray) -> np.ndarray:
+    """Un-blend anti-aliased edge pixels from the baked page background.
+
+    An edge pixel is physically `a*fg + (1-a)*bg_page`. Keeping the
+    blended colour under a partial alpha leaves a page-coloured fringe
+    once PowerPoint composites the PNG over a different fill. Solving
+    for fg removes the halo.
+    """
+    a = alpha.astype(np.float32) / 255.0
+    partial = (alpha > 24) & (alpha < 250)
+    if not bool(partial.any()):
+        return crop_bgr
+    out = crop_bgr.astype(np.float32)
+    a3 = a[..., None]
+    fg = (out - (1.0 - a3) * bg_est) / np.maximum(a3, 0.10)
+    fg = np.clip(fg, 0, 255)
+    out[partial] = fg[partial]
+    return out.astype(np.uint8)
+
+
+def _linear_edge_alpha(crop_bgr: np.ndarray, bg_est: np.ndarray,
+                       alpha: np.ndarray, core: np.ndarray,
+                       edge_px: np.ndarray) -> np.ndarray:
+    """Physically-motivated alpha for anti-aliased boundary pixels.
+
+    The soft ramp saturates fast, so a pixel that is only ~20% fg can
+    get ~90% opacity; decontamination then divides by a too-large alpha
+    and the page colour survives. Projecting the pixel onto the
+    bg→nearest-core-fg colour axis recovers the true blend fraction.
+    """
+    if not bool(core.any()) or not bool(edge_px.any()):
+        return alpha
+    inv = np.where(core, 0, 1).astype(np.uint8)
+    _dist, labels = cv2.distanceTransformWithLabels(
+        inv, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+    lut = np.zeros((int(labels.max()) + 1, 3), np.float32)
+    lut[labels[core]] = crop_bgr[core].astype(np.float32)
+    f = lut[labels]
+    c = crop_bgr.astype(np.float32)
+    num = ((c - bg_est) * (f - bg_est)).sum(axis=2)
+    den = ((f - bg_est) ** 2).sum(axis=2)
+    a_lin = np.clip(num / np.maximum(den, 1e-3), 0.0, 1.0)
+    out = alpha.copy()
+    out[edge_px] = np.minimum(
+        alpha[edge_px],
+        np.clip(a_lin[edge_px] * 255.0 + 12.0, 0, 255).astype(np.uint8))
+    return out
+
+
+def _line_art_keep_mask(crop_bgr: np.ndarray,
+                        diff: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    diff = np.abs(crop_bgr.astype(int) - bg.astype(int)).max(axis=2)
     sat = hsv[:, :, 1]
     keep = (
         (diff > 16)
         & ((sat > 16) | (gray < 238) | (gray > 245))
     )
-    keep = cv2.morphologyEx(
+    return cv2.morphologyEx(
         keep.astype(np.uint8) * 255,
         cv2.MORPH_CLOSE,
         np.ones((3, 3), np.uint8),
         iterations=1,
     ) > 0
+
+
+def _line_art_matte(crop_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(decontaminated BGR, alpha) matte for sparse line icons.
+
+    The foreground can be a pure stroke icon, a white badge on a coloured
+    title bar, or a filled warning triangle with white holes. We preserve
+    filled foreground islands and their enclosed holes, but leave
+    ordinary surrounding panel/background pixels transparent. Background
+    is estimated per pixel (gradient/card-edge tolerant) and anti-aliased
+    edges are un-blended from it so no page-colour halo survives.
+    """
+    h, w = crop_bgr.shape[:2]
+    if h == 0 or w == 0:
+        return crop_bgr, np.zeros((h, w), dtype=np.uint8)
+
+    if _border_is_uniform(crop_bgr):
+        # Flat background: the proven global border-median key. The bg
+        # estimate is still materialised per-pixel for decontamination.
+        bg_flat = _border_median_bgr(crop_bgr)
+        bg_est = np.tile(bg_flat.astype(np.float32), (h, w, 1))
+        diff = np.abs(crop_bgr.astype(int) - bg_flat.astype(int)).max(axis=2)
+        keep = _line_art_keep_mask(crop_bgr, diff)
+    else:
+        # Gradient / card-edge background: seed the foreground without a
+        # bg-colour hypothesis, then re-key against a local per-pixel
+        # background estimate.
+        seed = _local_foreground_seed(crop_bgr)
+        bg_est = _estimate_background_image(crop_bgr, seed)
+        diff = np.abs(crop_bgr.astype(np.float32) - bg_est).max(axis=2)
+        keep = _line_art_keep_mask(crop_bgr, diff)
 
     alpha_mask = np.zeros((h, w), dtype=bool)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -197,5 +337,55 @@ def _line_art_alpha(crop_bgr: np.ndarray) -> np.ndarray:
     soft = np.clip((diff.astype(int) - 8) * 14, 0, 255).astype(np.uint8)
     alpha[keep] = soft[keep]
     alpha[alpha_mask] = np.maximum(alpha[alpha_mask], 245)
+    # Confident-core = eroded filled islands (their outermost ring is
+    # anti-aliased and must stay refinable) plus pixels near the top of
+    # the crop's own contrast range.
+    interior = cv2.erode(alpha_mask.astype(np.uint8),
+                         np.ones((3, 3), np.uint8), iterations=1) > 0
+    d95 = float(np.percentile(diff[keep], 95)) if bool(keep.any()) else 0.0
+    core = interior | (diff >= max(24.0, 0.6 * d95))
+    alpha = _linear_edge_alpha(crop_bgr, bg_est, alpha, core,
+                               (keep | alpha_mask) & ~core)
     alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
+    # The blur bleeds opacity one pixel outward onto pure-background
+    # pixels. Their colour IS the page background, so any alpha there
+    # renders as a page-coloured halo on other fills — drop it.
+    stray = (~alpha_mask) & (diff < 8)
+    alpha[stray] = 0
+    fg = _decontaminate_edges(crop_bgr, alpha, bg_est)
+    return fg, alpha
+
+
+def _line_art_alpha(crop_bgr: np.ndarray) -> np.ndarray:
+    """Alpha-only view of `_line_art_matte` for mask consumers."""
+    _fg, alpha = _line_art_matte(crop_bgr)
     return alpha
+
+
+def refine_masked_asset_edges(crop_bgr: np.ndarray,
+                              alpha: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Soften + decontaminate the boundary of a hard sidecar mask.
+
+    Detector masks are near-binary; their boundary pixels keep the page
+    background blended into the RGB, which shows as a fringe on any
+    other fill. Feather only the outermost band and un-blend it from a
+    local background estimate — interior pixels are left untouched.
+    """
+    h, w = crop_bgr.shape[:2]
+    if h == 0 or w == 0 or alpha.shape[:2] != (h, w) or h * w > 400_000:
+        return crop_bgr, alpha
+    hard = alpha > 128
+    if not bool(hard.any()) or bool(hard.all()):
+        return crop_bgr, alpha
+    kernel = np.ones((3, 3), np.uint8)
+    interior = cv2.erode(hard.astype(np.uint8), kernel, iterations=1) > 0
+    band = hard & ~interior
+    if not bool(band.any()):
+        return crop_bgr, alpha
+    bg_est = _estimate_background_image(crop_bgr, hard)
+    diff = np.abs(crop_bgr.astype(np.float32) - bg_est).max(axis=2)
+    soft = np.clip((diff - 6.0) * 16.0, 0, 255).astype(np.uint8)
+    out_alpha = alpha.copy()
+    out_alpha[band] = np.minimum(out_alpha[band], soft[band])
+    fg = _decontaminate_edges(crop_bgr, out_alpha, bg_est)
+    return fg, out_alpha

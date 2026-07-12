@@ -389,11 +389,21 @@ def _connected_component_ink_samples(source_bgr: np.ndarray,
     }
 
 
+# Deck-level canvas size, stamped in main(). build_pptx_from_layout
+# letterboxes every slide into this one canvas, so glyph metrics must be
+# derived from the same scale — a slide's own aspect-derived width_in
+# diverges from the deck canvas in mixed-aspect decks.
+_DECK_SLIDE_SIZE: dict[str, Any] | None = None
+
+
 def _slide_pt_per_px(slide: dict[str, Any]) -> float:
     source_w = float(slide.get("source_width") or 1280)
-    slide_size = slide.get("slide_size") or {}
+    source_h = float(slide.get("source_height") or 720)
+    slide_size = _DECK_SLIDE_SIZE or slide.get("slide_size") or {}
     width_in = float(slide_size.get("width_in") or (source_w / 96.0))
-    return max(0.01, width_in * 72.0 / max(1.0, source_w))
+    height_in = float(slide_size.get("height_in") or (source_h / 96.0))
+    return max(0.01, min(width_in * 72.0 / max(1.0, source_w),
+                         height_in * 72.0 / max(1.0, source_h)))
 
 
 def _element_font_path(el: dict[str, Any]) -> str | None:
@@ -863,6 +873,8 @@ def main() -> int:
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     layout = json.loads(layout_path.read_text(encoding="utf-8-sig"))
+    global _DECK_SLIDE_SIZE
+    _DECK_SLIDE_SIZE = layout.get("slide_size") or None
     all_reports: list[dict[str, Any]] = []
 
     for iteration in range(1, max(1, int(args.iterations)) + 1):

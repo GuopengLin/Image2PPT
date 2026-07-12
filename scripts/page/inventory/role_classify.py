@@ -17,6 +17,17 @@ if str(PAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PAGE_DIR))
 
 from _heuristics import s_area, s_length  # noqa: E402
+from layout.connector_geometry import is_elbow_stroke_mask  # noqa: E402
+
+
+def _connector_fg_mask(crop: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    diff_white = np.abs(crop.astype(np.int16) - 255).max(axis=2)
+    return (
+        ((gray < 235) & (diff_white > 8))
+        | ((hsv[:, :, 1] > 30) & (diff_white > 6))
+    )
 
 
 def is_connector_like(crop: np.ndarray, scale: float) -> bool:
@@ -26,14 +37,19 @@ def is_connector_like(crop: np.ndarray, scale: float) -> bool:
     if max(w, h) < s_length(26, scale):
         return False
     if w * h > s_area(24000, scale):
-        return False
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    diff_white = np.abs(crop.astype(np.int16) - 255).max(axis=2)
-    fg = (
-        ((gray < 235) & (diff_white > 8))
-        | ((hsv[:, :, 1] > 30) & (diff_white > 6))
-    )
+        # PCA elongation can't see elbow connectors (they spread along
+        # two axes and their bbox area is large); give L-shaped thin
+        # strokes their own bounded check.
+        if w * h > s_area(160000, scale) or max(w, h) > s_length(640, scale):
+            return False
+        fg = _connector_fg_mask(crop)
+        fg_count = int(fg.sum())
+        if fg_count < s_area(40, scale):
+            return False
+        if fg_count / float(max(1, w * h)) > 0.12:
+            return False
+        return is_elbow_stroke_mask(fg)
+    fg = _connector_fg_mask(crop)
     fg_count = int(fg.sum())
     if fg_count < s_area(12, scale):
         return False

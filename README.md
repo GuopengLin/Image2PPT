@@ -30,7 +30,7 @@ DeckWeaver 可以把 GPT、Gemini等输出的图片重建为可编辑的 PowerPo
 
 ## 效果示例
 
-下图左侧是输入的原图（GPT 生成的隐私计算示意图），右侧是 DeckWeaver 自动重建后的 `.pptx` 经 LibreOffice 渲染回 PNG 的预览。文字全部是可编辑文本框，MPC 中心锁、连接线等都拆成了独立可移动 PNG 对象。
+下图左侧是输入的原图（GPT 生成的隐私计算示意图），右侧是 DeckWeaver 自动重建后的 `.pptx` 经 LibreOffice 渲染回 PNG 的预览。文字全部是可编辑文本框；示意图中的直线/折线/虚线/箭头连接线会还原成 PPT 原生可编辑线条，MPC 中心锁等图形则拆成独立可移动的透明 PNG 对象。
 
 <table>
   <tr>

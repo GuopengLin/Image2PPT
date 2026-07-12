@@ -425,6 +425,18 @@ def _has_list_marker(el: dict[str, Any]) -> bool:
     )
 
 
+def _position_locked(el: dict[str, Any]) -> bool:
+    """True when the element's box was measured by preview calibration.
+
+    calibrate_text_positions runs a closed loop against the rendered
+    preview, so its coordinates are pixel-accurate. The class/axis
+    snapping passes below run again after that calibration and must not
+    overwrite the measured position (same rule text_finalizers applies
+    for title centering).
+    """
+    return el.get("position_source") == "preview_calibrated"
+
+
 def _short_centered_stack_text(text: str) -> bool:
     stripped = str(text or "").strip()
     if not stripped:
@@ -599,6 +611,8 @@ def _apply_parent_column_alignment(
                 el = texts[i]["el"]
                 box = el.get("box")
                 if not box or len(box) != 4:
+                    continue
+                if _position_locked(el):
                     continue
                 old_x = float(box[0])
                 if abs(old_x - target_x) < 0.15:
@@ -795,6 +809,8 @@ def _apply_table_column_geometry_alignment(
                 el = item["el"]
                 box = el.get("box")
                 if not box or len(box) != 4:
+                    continue
+                if _position_locked(el):
                     continue
                 old_x = float(box[0])
                 if abs(old_x - target_x) > 34.0:
@@ -1097,7 +1113,7 @@ def _apply_bullet_marker_priors(
             if not name or not box or len(box) != 4:
                 continue
             old_x = float(box[0])
-            if abs(old_x - body_x) <= 34.0:
+            if abs(old_x - body_x) <= 34.0 and not _position_locked(el):
                 box[0] = round(body_x, 3)
                 _sync_text_box(item)
             y = float(box[1])
@@ -1206,6 +1222,8 @@ def _apply_class_position_priors(
             item = edge["item"]
             el = item["el"]
             box = el["box"]
+            if _position_locked(el):
+                continue
             old_x = float(box[0])
             if x_axis == "left":
                 new_x = target_axis
@@ -1285,6 +1303,8 @@ def _apply_class_position_priors(
             item = edge["item"]
             el = item["el"]
             box = el["box"]
+            if _position_locked(el):
+                continue
             old_y = float(box[1])
             if y_axis == "top":
                 new_y = target_axis_y
@@ -1340,6 +1360,8 @@ def _apply_class_position_priors(
             el = item["el"]
             box = el.get("box")
             if not box or len(box) != 4:
+                continue
+            if _position_locked(el):
                 continue
             old_x = float(box[0])
             new_x = round(target_center - float(box[2]) / 2.0, 3)
