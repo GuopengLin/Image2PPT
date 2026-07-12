@@ -693,6 +693,26 @@ class LayoutBuilder:
         })
         return True
 
+    def _connector_mask_alpha(self, el: dict, crop: np.ndarray,
+                              x1: int, y1: int) -> np.ndarray | None:
+        """Sidecar-mask alpha for connectors recovered from merged blobs.
+
+        Their crops can contain card corners near the touching joint, so
+        keying the whole crop would poison the geometry fit — the
+        detector's own mask is the authoritative stroke footprint.
+        """
+        mask_path = el.get("mask_path")
+        if not mask_path or not Path(mask_path).exists():
+            return None
+        m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if m is None or m.shape[:2] != self.source.shape[:2]:
+            return None
+        h, w = crop.shape[:2]
+        alpha = m[y1:y1 + h, x1:x1 + w]
+        if alpha.shape[:2] != (h, w) or int((alpha > 40).sum()) < 12:
+            return None
+        return alpha
+
     def _try_emit_native_connector(self, el: dict, crop: np.ndarray,
                                    x1: int, y1: int) -> bool:
         """Emit a connector as a native PPT line when the fit is confident.
@@ -702,7 +722,9 @@ class LayoutBuilder:
         the bbox as `box` so containment z-ordering places it above the
         background/cards it lies on.
         """
-        _fg, alpha = _line_art_matte(crop)
+        alpha = self._connector_mask_alpha(el, crop, x1, y1)
+        if alpha is None:
+            _fg, alpha = _line_art_matte(crop)
         geom = extract_connector_geometry(crop, alpha)
         if geom is None:
             return False
@@ -831,6 +853,14 @@ class LayoutBuilder:
         # visually-identical labels (`1000亿元` vs `24.22%`).
         self.text_elements = unify_group_sizes(self.text_elements)
         self.image_elements = topo_sort_by_containment(self.image_elements)
+        # Native connector lines render above every image: strokes that
+        # should be occluded were already clipped to the card edges at
+        # extraction time, so whatever remains is visually on top.
+        lines = [e for e in self.image_elements if e.get("type") == "line"]
+        if lines:
+            self.image_elements = [
+                e for e in self.image_elements if e.get("type") != "line"
+            ] + lines
 
     def write(self) -> None:
         manifest = {

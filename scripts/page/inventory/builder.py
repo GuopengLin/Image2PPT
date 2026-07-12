@@ -37,6 +37,9 @@ from icon import (  # noqa: E402
 )
 
 from inventory.badge_trim import trim_filled_badge  # noqa: E402
+from inventory.connector_split import (  # noqa: E402
+    split_connectors_from_component,
+)
 from inventory.child_fill import (  # noqa: E402
     clean_child_fill,
     ring_bg_quality,
@@ -140,6 +143,9 @@ class InventoryBuilder:
         self.foreground_records: list[tuple] = []
         self.subicon_records: list[tuple] = []
         self.line_subicon_records: list[tuple] = []
+        # (x1, y1, x2, y2, full_mask, z_front) strokes recovered from
+        # components where a connector touches/crosses the cards it joins.
+        self.connector_records: list[tuple] = []
         self.internal_shape_records: list[tuple] = []
         self.inpainted_children: set[tuple[int, int, int, int]] = set()
         self.unclean_nested_children: set[tuple[int, int, int, int]] = set()
@@ -382,6 +388,118 @@ class InventoryBuilder:
                     self._scan_line_subicons_inplace(ax1, ay1, ax2, ay2)
                     self._scan_internal_shapes_inplace(ax1, ay1, ax2, ay2)
 
+    def _known_card_boxes_within(
+            self, box: tuple[int, int, int, int]) -> list[tuple]:
+        """Outline/container rects already recorded inside `box`."""
+        bx1, by1, bx2, by2 = box
+        b_area = max(1, (bx2 - bx1) * (by2 - by1))
+        cards = []
+        candidates = (
+            [(r[0], r[1], r[2], r[3]) for r in self.outline_records]
+            + [_box4(r) for r in self.foreground_records
+               if _box4(r) != box]
+        )
+        for cx1, cy1, cx2, cy2 in candidates:
+            c_area = max(1, (cx2 - cx1) * (cy2 - cy1))
+            if c_area >= 0.90 * b_area:
+                continue
+            ox1, oy1 = max(bx1, cx1), max(by1, cy1)
+            ox2, oy2 = min(bx2, cx2), min(by2, cy2)
+            if ox2 <= ox1 or oy2 <= oy1:
+                continue
+            if (ox2 - ox1) * (oy2 - oy1) < 0.80 * c_area:
+                continue
+            cards.append((cx1 - bx1, cy1 - by1, cx2 - bx1, cy2 - by1))
+        return cards
+
+    def _split_connectors_touching_cards(self) -> None:
+        """Recover connector strokes merged into card components.
+
+        A connector that touches or crosses a card fuses with it into one
+        connected component, so `foreground_role_for_box` never sees a
+        connector. Decompose such components (see connector_split.py),
+        record the strokes as independent connector records, inpaint
+        their pixels out of `cleaned`, and — when cards + strokes explain
+        the component — drop the merged blob in favour of its parts.
+        """
+        min_area = s_area(20000, self.scale)
+        min_side = s_length(120, self.scale)
+        page_fg = self._foreground_mask(self.cleaned, self.args.dilate) > 0
+        kept_records: list[tuple] = []
+        new_card_boxes: list[tuple] = []
+        dropped_boxes: list[tuple] = []
+        for record in list(self.foreground_records):
+            x1, y1, x2, y2 = _box4(record)
+            w, h = x2 - x1, y2 - y1
+            if w * h < min_area or max(w, h) < min_side:
+                kept_records.append(record)
+                continue
+            crop_probe = self.icon_probe[y1:y2, x1:x2]
+            if is_connector_like(crop_probe, self.scale):
+                # Already a clean connector component; the normal role
+                # path handles it.
+                kept_records.append(record)
+                continue
+            result = split_connectors_from_component(
+                page_fg[y1:y2, x1:x2],
+                crop_probe,
+                self._known_card_boxes_within((x1, y1, x2, y2)),
+                self.scale,
+            )
+            if result is None or not result["connectors"]:
+                kept_records.append(record)
+                continue
+            for piece in result["connectors"]:
+                px1, py1, px2, py2 = piece["bbox"]
+                full_mask = np.zeros((self.img_h, self.img_w),
+                                     dtype=np.uint8)
+                full_mask[y1:y2, x1:x2] = (
+                    piece["mask"].astype(np.uint8) * 255)
+                self.connector_records.append((
+                    x1 + px1, y1 + py1, x1 + px2, y1 + py2,
+                    full_mask, bool(piece.get("z_front"))))
+                local = self.cleaned[y1:y2, x1:x2]
+                inpaint_region_inplace(local, piece["mask"],
+                                       scale=self.scale)
+            drop_component = (
+                result["explained_frac"] >= 0.85
+                and bool(result["core_boxes"]
+                         or self._known_card_boxes_within(
+                             (x1, y1, x2, y2)))
+            )
+            if drop_component:
+                dropped_boxes.append((x1, y1, x2, y2))
+                for cx1, cy1, cx2, cy2 in result["core_boxes"]:
+                    new_card_boxes.append(
+                        (x1 + cx1, y1 + cy1, x1 + cx2, y1 + cy2))
+            else:
+                kept_records.append(record)
+        self.foreground_records = kept_records
+        for cx1, cy1, cx2, cy2 in new_card_boxes:
+            self._append_foreground_record(cx1, cy1, cx2, cy2)
+        if dropped_boxes:
+            # The merged blob's own contour often registered as a fake
+            # whole-diagram outline ring. It used to be culled as a
+            # duplicate of the (now removed) full crop — cull it here.
+            def _is_phantom(o: tuple) -> bool:
+                ox1, oy1, ox2, oy2 = int(o[0]), int(o[1]), int(o[2]), int(o[3])
+                oarea = max(1, (ox2 - ox1) * (oy2 - oy1))
+                for dx1, dy1, dx2, dy2 in dropped_boxes:
+                    darea = max(1, (dx2 - dx1) * (dy2 - dy1))
+                    if min(oarea, darea) / max(oarea, darea) < 0.80:
+                        continue
+                    ix1, iy1 = max(ox1, dx1), max(oy1, dy1)
+                    ix2, iy2 = min(ox2, dx2), min(oy2, dy2)
+                    if ix2 <= ix1 or iy2 <= iy1:
+                        continue
+                    if (ix2 - ix1) * (iy2 - iy1) >= 0.92 * min(oarea, darea):
+                        return True
+                return False
+
+            self.outline_records = [
+                o for o in self.outline_records if not _is_phantom(o)
+            ]
+
     def _drop_foregrounds_covered_by_shapes(self) -> None:
         """Drop foregrounds whose bbox is largely covered by sub-icons."""
         shape_boxes = (
@@ -530,6 +648,7 @@ class InventoryBuilder:
             [_box4(r) for r in self.foreground_records]
             + [_box4(r) for r in self.subicon_records]
             + [_box4(r) for r in self.line_subicon_records]
+            + [_box4(r) for r in self.connector_records]
             + [_box4(r) for r in self.internal_shape_records]
             + [(x1, y1, x2, y2) for (x1, y1, x2, y2, _) in self.outline_records]
         )
@@ -563,7 +682,9 @@ class InventoryBuilder:
             self.visual_idx += 1
         masks_out_dir = (Path(self.args.masks_dir)
                          if self.args.masks_dir else None)
-        if self.outline_records and masks_out_dir is None:
+        needs_masks = (self.outline_records or self.line_subicon_records
+                       or self.connector_records)
+        if needs_masks and masks_out_dir is None:
             out_path = Path(self.args.out)
             masks_out_dir = out_path.with_name(f"{out_path.stem}_masks")
         if masks_out_dir is not None:
@@ -620,6 +741,24 @@ class InventoryBuilder:
             if masks_out_dir is not None:
                 mask_path = masks_out_dir / f"{comp_id}.mask.png"
                 cv2.imwrite(str(mask_path), line_mask)
+                entry["mask_path"] = str(mask_path)
+            self.inventory.append(entry)
+            self.visual_idx += 1
+        # Strokes recovered from card-touching/crossing components. Their
+        # pixels were inpainted out of `cleaned`, so the crop must come
+        # from the text-only sidecar (source="source" routes there).
+        for x1, y1, x2, y2, conn_mask, z_front in self.connector_records:
+            comp_id = f"v{self.visual_idx:03d}"
+            entry = {
+                "id": comp_id, "type": "image",
+                "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                "source": "source", "role": "connector",
+            }
+            if z_front:
+                entry["z"] = "front"
+            if masks_out_dir is not None:
+                mask_path = masks_out_dir / f"{comp_id}.mask.png"
+                cv2.imwrite(str(mask_path), conn_mask)
                 entry["mask_path"] = str(mask_path)
             self.inventory.append(entry)
             self.visual_idx += 1
@@ -730,6 +869,7 @@ class InventoryBuilder:
     def build_and_write(self) -> None:
         self._emit_text_entries()
         self._detect_visual_components()
+        self._split_connectors_touching_cards()
         self._drop_foregrounds_covered_by_shapes()
         self._drop_outlines_duplicated_by_full_crop()
         self._inpaint_nested_foreground_in_parents()

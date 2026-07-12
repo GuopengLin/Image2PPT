@@ -109,6 +109,11 @@ def _fit_straight(pts: np.ndarray, weights: np.ndarray) -> dict | None:
     ink_cols = max(1, len(np.unique(np.round(t).astype(int))))
     # -0.8 compensates the matte's close/blur spread.
     ink_width = float(weights.sum()) / float(ink_cols) - 0.8
+    # A solid stroke's ink mass fills its profile extent; two nearby
+    # parallel strokes (or hollow rails) leave the band mostly empty —
+    # don't collapse them into one fat line.
+    if stroke_w > 6.0 and (ink_width + 0.8) < 0.45 * stroke_w:
+        return None
     ink_width = float(np.clip(ink_width, 0.75, stroke_w))
 
     # Arrowheads widen the profile near an end.
@@ -233,6 +238,24 @@ def _fit_elbow(alpha: np.ndarray) -> dict | None:
         "arrow_start": False,
         "arrow_end": False,
     }
+
+
+def fit_line_geometry(fg: np.ndarray) -> dict | None:
+    """Fit straight/elbow line geometry to a binary foreground mask.
+
+    Same models as `extract_connector_geometry` but without needing a
+    colour crop — used by inventory-side decomposition to decide whether
+    a residual stroke piece is really a line.
+    """
+    alpha = fg.astype(np.uint8) * 255
+    fg_pts = _foreground_points(alpha)
+    if fg_pts is None:
+        return None
+    pts, weights = fg_pts
+    geom = _fit_straight(pts, weights)
+    if geom is None:
+        geom = _fit_elbow(alpha)
+    return geom
 
 
 def is_elbow_stroke_mask(fg: np.ndarray) -> bool:
