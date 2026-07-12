@@ -116,11 +116,34 @@ def _emit_text_element_record(
     # extent is well under bbox_h (≤ 50 %), the bbox likely includes
     # shadow/glow above and below the actual glyphs. Use ink_h.
     ink_h = style.pop("ink_h", None)
+    ink_band_h = style.pop("ink_band_h", None)
+    ink_band_y0 = style.pop("ink_band_y0", None)
     effective_h = int(y2 - y1)
     visible_chars = sum(1 for c in raw_text if c.strip() and c != "\n")
     if (ink_h and effective_h > 30 and visible_chars >= 3
             and ink_h <= 0.5 * effective_h):
         effective_h = ink_h
+    elif (ink_band_h and ink_band_y0 is not None
+            and effective_h > 26 and visible_chars >= 3
+            and ink_band_h <= 0.72 * effective_h):
+        # The bbox swallowed separated non-glyph rows (dashed arrows,
+        # icon strips beside the title). The dominant contiguous ink
+        # band is the glyph line itself — tighten the whole record to
+        # it. Adjusting only the font size is not enough: render_fit
+        # scores candidates against the source ink inside the bbox, so
+        # a dirty bbox pushes the size right back up, and a middle
+        # vertical anchor in the tall box also mis-centres the text.
+        y1 = int(y1 + ink_band_y0)
+        y2 = int(min(y2, y1 + ink_band_h + 2))
+        effective_h = int(y2 - y1)
+        # Clamp the per-char boxes to the band too: the size calibration
+        # loop measures its target ink from them, and dirty char boxes
+        # would pull the size straight back up.
+        if source_char_boxes:
+            source_char_boxes = [
+                [bx1, max(by1, y1), bx2, min(by2, y2)]
+                for bx1, by1, bx2, by2 in source_char_boxes
+            ]
     size = font_size_pt(safe_text, x2 - x1, effective_h,
                         pt_per_px=pt_per_px)
     if mixed_size is not None:

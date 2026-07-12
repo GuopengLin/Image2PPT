@@ -131,11 +131,31 @@ def detect_text_style(bbox: list[int], orig_img: np.ndarray,
     # ink_h: tight vertical extent of strokes inside the bbox. Used as
     # (a) a decoration-padding probe by the caller, and (b) the
     # denominator for stroke-width-based bold detection below.
+    # ink_band_h: height of the DOMINANT contiguous row band. When the
+    # OCR bbox swallowed extra content below/above the glyphs (dashed
+    # arrows, icon rows), the full extent spans glyphs+decoration while
+    # the dominant band is just the glyph line — the caller sizes the
+    # font from it.
     ink_h: int | None = None
+    ink_band_h: int | None = None
     row_ink = text_mask.sum(axis=1) >= 2
     rows = np.where(row_ink)[0]
+    ink_band_y0: int | None = None
     if rows.size >= 2:
         ink_h = int(rows.max() - rows.min() + 1)
+        bands: list[tuple[int, int]] = []      # (start_row, height)
+        start = int(rows[0])
+        run = 1
+        for i in range(1, len(rows)):
+            if rows[i] - rows[i - 1] <= 3:      # bridge AA gaps
+                run += int(rows[i] - rows[i - 1])
+            else:
+                bands.append((start, run))
+                start = int(rows[i])
+                run = 1
+        bands.append((start, run))
+        ink_band_y0, ink_band_h = max(bands, key=lambda b: b[1])
+        ink_band_h = int(ink_band_h)
 
     # Bold detection via absolute stroke half-width on the distance
     # transform of the ink mask. Density misfires across font sizes;
@@ -152,7 +172,8 @@ def detect_text_style(bbox: list[int], orig_img: np.ndarray,
             density = float(text_mask.sum()) / max(1, h * w)
             bold = density > 0.27
 
-    result = {"color": color, "bold": bool(bold), "ink_h": ink_h}
+    result = {"color": color, "bold": bool(bold), "ink_h": ink_h,
+              "ink_band_h": ink_band_h, "ink_band_y0": ink_band_y0}
 
     if text and len(text) >= 2:
         runs = _per_char_runs(bbox, text, orig_img, bg, raw_line_hex,
