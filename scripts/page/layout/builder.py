@@ -609,10 +609,14 @@ class LayoutBuilder:
                 return
         if self._is_empty_asset(crop, None, sparse_ok=sparse_visual):
             return
-        self._emit_role_specific_crop(el, asset_name, crop,
-                                      x1, y1, x2, y2,
-                                      scrub_icon_text,
-                                      try_matte=implicit_cv2_icon)
+        if not self._emit_role_specific_crop(el, asset_name, crop,
+                                             x1, y1, x2, y2,
+                                             scrub_icon_text,
+                                             try_matte=implicit_cv2_icon):
+            # No asset PNG was written (e.g. line-art alpha came out
+            # empty) — registering the element would make the PPTX
+            # build crash on the missing file.
+            return
         self.manifest_assets.append({
             "name": asset_name,
             "box": [int(x1), int(y1), int(x2), int(y2)],
@@ -759,7 +763,8 @@ class LayoutBuilder:
                                  crop: np.ndarray,
                                  x1: int, y1: int, x2: int, y2: int,
                                  scrub_icon_text: bool,
-                                 try_matte: bool = False) -> None:
+                                 try_matte: bool = False) -> bool:
+        """Write the asset PNG; returns False when nothing was written."""
         role = el.get("role")
         if role == "subicon":
             # White icon on dark bg → keep only near-white pixels opaque,
@@ -780,7 +785,7 @@ class LayoutBuilder:
         elif role in {"badge_subicon", "connector", "line_subicon"}:
             crop, alpha = _line_art_matte(crop)
             if int((alpha > 16).sum()) < 4:
-                return
+                return False
             crop = _scrub_text_boxes_from_icon_crop(
                 crop, (int(x1), int(y1), int(x2), int(y2)),
                 self.text_boxes, alpha=alpha)
@@ -797,6 +802,7 @@ class LayoutBuilder:
                             np.dstack([crop, alpha]))
             else:
                 cv2.imwrite(str(self.asset_dir / asset_name), crop)
+        return True
 
     # ------------------------------------------------------------------
     # Build orchestration
