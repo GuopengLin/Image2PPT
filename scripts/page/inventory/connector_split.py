@@ -36,7 +36,11 @@ if str(PAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PAGE_DIR))
 
 from _heuristics import s_area, s_length  # noqa: E402
-from layout.connector_geometry import fit_line_geometry  # noqa: E402
+from layout.connector_geometry import (  # noqa: E402
+    MIN_STROKE_CONTRAST,
+    fit_line_geometry,
+    stroke_background_contrast,
+)
 from shared.geometry import connector_on_container_border  # noqa: E402
 
 
@@ -83,8 +87,16 @@ def _solid_card_cores(fg: np.ndarray, scale: float) -> list[tuple[int, int, int,
         if min(tw, th) < min_side:
             continue
         trimmed = labels[ty1:ty2, tx1:tx2] == i
+        trimmed_px = float(trimmed.sum())
+        # Trimming may only shave a thin tail off a rectangle. When it
+        # removes a big fraction of the blob (a triangle's occupancy
+        # rises toward its dense centre, so trimming keeps only the
+        # middle slab), this is a solid non-rectangular shape, not a
+        # card — cutting it up would butcher the artwork.
+        if trimmed_px < 0.80 * float(area):
+            continue
         # Cards are rectangles — a straggly eroded blob is texture.
-        if float(trimmed.sum()) < 0.55 * tw * th:
+        if trimmed_px < 0.60 * tw * th:
             continue
         x1 = max(0, tx1 - pad)
         y1 = max(0, ty1 - pad)
@@ -235,6 +247,7 @@ def split_connectors_from_component(
         return None
 
     min_len = s_length(30, scale)
+    max_stroke = max(9.0, s_length(9, scale))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         residual.astype(np.uint8), 8)
     pieces: list[dict] = []
@@ -250,6 +263,15 @@ def split_connectors_from_component(
             continue
         geom = fit_line_geometry(piece_mask)
         if geom is None:
+            continue
+        # Residual slivers of solid artwork (a triangle's corner wedge)
+        # can satisfy the line models — real connector strokes are thin.
+        if geom["width_px"] > max_stroke:
+            continue
+        # …and visible: near-zero contrast pieces are anti-aliased card
+        # fringes or erased regions, not lines.
+        if stroke_background_contrast(
+                probe_crop, piece_mask) < MIN_STROKE_CONTRAST:
             continue
         pieces.append({"bbox": bbox, "mask": piece_mask, "z_front": False,
                        "geom_kind": geom["kind"]})

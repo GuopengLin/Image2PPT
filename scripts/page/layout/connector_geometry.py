@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[2]    # scripts/
@@ -46,26 +47,56 @@ def _stroke_color_hex(crop_bgr: np.ndarray, alpha: np.ndarray) -> str:
     return bgr_to_hex(np.median(pixels.reshape(-1, 3), axis=0))
 
 
-def _dash_pattern(t: np.ndarray) -> bool:
-    """Detect interior gaps in the integer projection coverage."""
+def _coverage_runs(t: np.ndarray) -> tuple[list[int], list[int], int]:
+    """(occupied run lengths, interior gap lengths, span) along the axis."""
     ti = np.unique(np.round(t).astype(int))
     if len(ti) < 2:
-        return False
+        return [], [], 0
     span = int(ti.max() - ti.min()) + 1
     covered = np.zeros(span, dtype=bool)
     covered[ti - ti.min()] = True
-    gaps = 0
-    gap_len = 0
-    total_gap = 0
+    runs: list[int] = []
+    gaps: list[int] = []
+    run_len = gap_len = 0
     for c in covered:
-        if not c:
-            gap_len += 1
+        if c:
+            run_len += 1
+            if gap_len:
+                gaps.append(gap_len)
+                gap_len = 0
         else:
-            if gap_len >= 3:
-                gaps += 1
-                total_gap += gap_len
-            gap_len = 0
-    return bool(gaps >= 2 and total_gap >= 0.08 * span)
+            gap_len += 1
+            if run_len:
+                runs.append(run_len)
+                run_len = 0
+    if run_len:
+        runs.append(run_len)
+    return runs, gaps, span
+
+
+def _dash_pattern(t: np.ndarray) -> bool:
+    """Detect interior gaps in the integer projection coverage."""
+    runs, gaps, span = _coverage_runs(t)
+    big_gaps = [g for g in gaps if g >= 3]
+    return bool(len(big_gaps) >= 2 and sum(big_gaps) >= 0.08 * span)
+
+
+def _irregular_glyph_row(t: np.ndarray) -> bool:
+    """True when the coverage looks like a text row, not a line.
+
+    An unerased text line (missed by OCR) is elongated and sparse
+    enough to pass the connector role test, and the straight fit then
+    flattens it into a solid bar. Real dashes have near-uniform segment
+    and gap lengths; glyph runs vary wildly.
+    """
+    runs, gaps, _span = _coverage_runs(t)
+    if len(runs) < 4 or len(gaps) < 3:
+        return False
+    runs_a = np.array(runs, dtype=float)
+    gaps_a = np.array(gaps, dtype=float)
+    run_cv = float(runs_a.std() / max(1e-3, runs_a.mean()))
+    gap_cv = float(gaps_a.std() / max(1e-3, gaps_a.mean()))
+    return bool(run_cv > 0.65 or gap_cv > 0.90)
 
 
 def _fit_straight(pts: np.ndarray, weights: np.ndarray) -> dict | None:
@@ -109,10 +140,11 @@ def _fit_straight(pts: np.ndarray, weights: np.ndarray) -> dict | None:
     ink_cols = max(1, len(np.unique(np.round(t).astype(int))))
     # -0.8 compensates the matte's close/blur spread.
     ink_width = float(weights.sum()) / float(ink_cols) - 0.8
-    # A solid stroke's ink mass fills its profile extent; two nearby
-    # parallel strokes (or hollow rails) leave the band mostly empty —
-    # don't collapse them into one fat line.
-    if stroke_w > 6.0 and (ink_width + 0.8) < 0.45 * stroke_w:
+    # A solid stroke's ink mass fills its profile extent. Two nearby
+    # parallel strokes, hollow rails, or a dense unerased TEXT ROW all
+    # leave the band mostly empty — none of them may collapse into one
+    # fat bar.
+    if stroke_w > 4.0 and (ink_width + 0.8) < 0.45 * stroke_w:
         return None
     ink_width = float(np.clip(ink_width, 0.75, stroke_w))
 
@@ -143,6 +175,8 @@ def _fit_straight(pts: np.ndarray, weights: np.ndarray) -> dict | None:
     if residual > max(2.2, 0.90 * stroke_w):
         return None
 
+    if _irregular_glyph_row(t[shaft]):
+        return None
     dash = _dash_pattern(t[shaft])
 
     p1 = center + float(t.min()) * u + d_med * v
@@ -157,6 +191,7 @@ def _fit_straight(pts: np.ndarray, weights: np.ndarray) -> dict | None:
         "kind": "straight",
         "points": points,
         "width_px": ink_width,
+        "extent_px": stroke_w,
         "dash": "dash" if dash else None,
         "arrow_start": bool(arrow_start),
         "arrow_end": bool(arrow_end),
@@ -234,6 +269,7 @@ def _fit_elbow(alpha: np.ndarray) -> dict | None:
         "kind": "elbow",
         "points": [(h_far, hy), (float(vx), hy), (float(vx), v_far)],
         "width_px": ink_width,
+        "extent_px": band_w,
         "dash": None,
         "arrow_start": False,
         "arrow_end": False,
@@ -371,6 +407,78 @@ def merge_collinear_dash_runs(entries: list[dict]) -> list[dict]:
     return out
 
 
+def stroke_background_contrast(crop_bgr: np.ndarray,
+                               fg: np.ndarray) -> float:
+    """Max-channel difference between stroke and surrounding colours.
+
+    A real connector is visible against its background; a near-zero
+    contrast "line" is an artefact of residual masks (anti-aliased card
+    fringes, erased regions) and must not become a drawn shape.
+    """
+    if not bool(fg.any()):
+        return 0.0
+    stroke = np.median(crop_bgr[fg].reshape(-1, 3), axis=0)
+    ring = cv2.dilate(fg.astype(np.uint8), np.ones((3, 3), np.uint8),
+                      iterations=3) > 0
+    ring &= ~fg
+    if not bool(ring.any()):
+        ring = ~fg
+    if not bool(ring.any()):
+        return 0.0
+    bg = np.median(crop_bgr[ring].reshape(-1, 3), axis=0)
+    return float(np.abs(stroke - bg).max())
+
+
+# Below this stroke-vs-surround contrast a fitted line would be
+# invisible in the source — it is a residual-mask artefact.
+MIN_STROKE_CONTRAST = 20.0
+
+
+def _looks_like_glyph_row(crop_bgr: np.ndarray, alpha: np.ndarray) -> bool:
+    """Component-density test separating text rows from dashed lines.
+
+    Dash/dot segments are SOLID (ink fills each segment's own bbox);
+    glyphs are stroke art (~40% fill). A dense bold CJK row that slipped
+    past the connector role test defeats every projection statistic —
+    per-component density is the discriminator that survives.
+
+    Works on a strict raw ink mask (no morphology, no hole filling):
+    the matte's hole-filling turns glyphs into solid blobs and would
+    hide exactly the structure this test needs.
+    """
+    bg_px = crop_bgr[alpha < 16]
+    if len(bg_px) < 12:
+        return False
+    bg = np.median(bg_px.reshape(-1, 3), axis=0)
+    ink = np.abs(crop_bgr.astype(np.int16) - bg.astype(np.int16)
+                 ).max(axis=2) > 45
+    ink &= alpha > 40
+    n, _labels, stats, _ = cv2.connectedComponentsWithStats(
+        ink.astype(np.uint8), 8)
+    densities = []
+    widths = []
+    for i in range(1, n):
+        _x, _y, cw, ch, area = (int(v) for v in stats[i])
+        if area < 8:
+            continue
+        densities.append(area / float(max(1, cw * ch)))
+        widths.append(float(cw))
+    if len(densities) < 3:
+        return False
+    dens = np.array(densities)
+    ws = np.array(widths)
+    w_cv = float(ws.std() / max(1e-3, ws.mean()))
+    # Dash segments and dots are UNIFORM stamps (measured width CV
+    # ≤0.05); glyphs are sparse AND vary in width (CJK rows ≥0.28,
+    # mixed text ≥0.5). Require both signals so anti-aliased dots
+    # (density dips below the solid band) stay accepted.
+    if float(np.median(dens)) < 0.72 and w_cv > 0.15:
+        return True
+    # Many solid-but-ragged stamps (disconnected Latin/stroke glyphs)
+    # are not a dash pattern either — dashes never vary this much.
+    return bool(len(densities) >= 6 and w_cv > 0.40)
+
+
 def extract_connector_geometry(crop_bgr: np.ndarray,
                                alpha: np.ndarray) -> dict | None:
     """Fit a straight or elbow line model to a connector matte.
@@ -388,6 +496,10 @@ def extract_connector_geometry(crop_bgr: np.ndarray,
     if geom is None:
         geom = _fit_elbow(alpha)
     if geom is None:
+        return None
+    if stroke_background_contrast(crop_bgr, alpha > 40) < MIN_STROKE_CONTRAST:
+        return None
+    if _looks_like_glyph_row(crop_bgr, alpha):
         return None
     geom["color"] = _stroke_color_hex(crop_bgr, alpha)
     return geom

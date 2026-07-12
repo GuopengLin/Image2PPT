@@ -737,6 +737,12 @@ class LayoutBuilder:
         geom = extract_connector_geometry(crop, alpha)
         if geom is None:
             return False
+        # Real connector/divider strokes are thin. A profile this thick
+        # is dense artwork or a bold unerased text row that slipped past
+        # the connector role test — keep the raster fallback so the
+        # original pixels stay visible.
+        if geom.get("extent_px", 0.0) > max(12.0, 12.0 * self.inpaint_scale):
+            return False
         points = [[round(x1 + px, 1), round(y1 + py, 1)]
                   for px, py in geom["points"]]
         pxs = [p[0] for p in points]
