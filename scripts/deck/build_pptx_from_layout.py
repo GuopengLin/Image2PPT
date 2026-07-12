@@ -382,8 +382,16 @@ class Builder:
 
     def add_image(self, slide, el: dict[str, Any]) -> None:
         left, top, width, height = el["box"]
+        path = self.image_path(el["path"])
+        if not path.exists():
+            # A missing asset (e.g. an emitter that bailed after the
+            # element was registered, or a hand-edited layout) must not
+            # abort the whole deck — skip it and say so.
+            print(f"WARNING: image asset missing, skipped: {path}",
+                  file=sys.stderr)
+            return
         pic = slide.shapes.add_picture(
-            str(self.image_path(el["path"])),
+            str(path),
             self.x(left),
             self.y(top),
             width=self.w(width),

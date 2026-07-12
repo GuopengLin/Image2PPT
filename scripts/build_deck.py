@@ -212,6 +212,24 @@ def _auto_workers(n_pages: int) -> int:
     return max(1, min(cores, n_pages, 8))
 
 
+def run_stage(cmd: list[str]) -> subprocess.CompletedProcess:
+    """`subprocess.run(check=True, capture_output=True)` that keeps logs.
+
+    With captured output, a failing stage's traceback lives only in
+    `exc.stderr` — without this wrapper the user just sees "returned
+    non-zero exit status N" and the real error is lost.
+    """
+    try:
+        return subprocess.run(cmd, check=True, capture_output=True,
+                              text=True)
+    except subprocess.CalledProcessError as exc:
+        if exc.stdout:
+            print(exc.stdout, end="", flush=True)
+        if exc.stderr:
+            print(exc.stderr, end="", file=sys.stderr, flush=True)
+        raise
+
+
 def banner(title: str) -> None:
     print(f"\n=== {title} ===", flush=True)
 
@@ -328,12 +346,10 @@ def main() -> int:
     # ---- Stage 2: combine_layouts ----
     banner("2/5  combine_layouts")
     ts = time.time()
-    r = subprocess.run(
+    r = run_stage(
         [sys.executable, str(SCRIPTS_ROOT / "deck" / "combine_layouts.py"),
          "--layouts", str(layouts_dir),
-         "--out", str(combined_path)],
-        check=True, capture_output=True, text=True,
-    )
+         "--out", str(combined_path)])
     print(r.stdout.strip())
     print(f"  stage 2 done in {time.time() - ts:.1f}s", flush=True)
 
@@ -353,16 +369,14 @@ def main() -> int:
         banner("2b/5  classify_text_slots")
         ts = time.time()
         slot_report = work / "debug" / "text_slot_classes.json"
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "classify_text_slots.py"),
              "--layout", str(combined_path),
              "--out", str(slot_report),
              "--apply",
              "--min-group-size", "2",
-             "--min-apply-size", "3"],
-            check=True, capture_output=True, text=True,
-        )
+             "--min-apply-size", "3"])
         if r.stdout.strip():
             print(r.stdout.strip())
         print(f"  -> {slot_report}")
@@ -394,14 +408,12 @@ def main() -> int:
     else:
         banner("3/5  build_pptx_from_layout")
         ts = time.time()
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "build_pptx_from_layout.py"),
              "--layout", str(combined_path),
              "--assets-root", str(work),
-             "--out", str(pptx_path)],
-            check=True, capture_output=True, text=True,
-        )
+             "--out", str(pptx_path)])
         if r.stdout.strip():
             print(r.stdout.strip())
         print(f"  -> {pptx_path}")
@@ -411,29 +423,25 @@ def main() -> int:
     if should_calibrate:
         banner("3b/5  calibrate_text_sizes")
         ts = time.time()
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "calibrate_text_sizes.py"),
              "--layout", str(combined_path),
              "--source-dir", str(src),
              "--work-dir", str(work),
              "--assets-root", str(work),
-             "--iterations", str(args.font_calibration_iterations)],
-            check=True, capture_output=True, text=True,
-        )
+             "--iterations", str(args.font_calibration_iterations)])
         if r.stdout.strip():
             print(r.stdout.strip())
         slot_report = work / "debug" / "text_slot_classes.after_size.json"
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "classify_text_slots.py"),
              "--layout", str(combined_path),
              "--out", str(slot_report),
              "--apply",
              "--min-group-size", "2",
-             "--min-apply-size", "3"],
-            check=True, capture_output=True, text=True,
-        )
+             "--min-apply-size", "3"])
         if r.stdout.strip():
             print(r.stdout.strip())
         # Intermediate draft pptx between size and position calibration
@@ -444,7 +452,7 @@ def main() -> int:
 
         banner("3c/5  calibrate_text_positions")
         ts = time.time()
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "calibrate_text_positions.py"),
              "--layout", str(combined_path),
@@ -452,33 +460,27 @@ def main() -> int:
              "--work-dir", str(work),
              "--assets-root", str(work),
              "--iterations", str(args.calibration_iterations),
-             "--max-shift", str(args.calibration_max_shift)],
-            check=True, capture_output=True, text=True,
-        )
+             "--max-shift", str(args.calibration_max_shift)])
         if r.stdout.strip():
             print(r.stdout.strip())
         slot_report = work / "debug" / "text_slot_classes.after_position.json"
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "classify_text_slots.py"),
              "--layout", str(combined_path),
              "--out", str(slot_report),
              "--apply",
              "--min-group-size", "2",
-             "--min-apply-size", "3"],
-            check=True, capture_output=True, text=True,
-        )
+             "--min-apply-size", "3"])
         if r.stdout.strip():
             print(r.stdout.strip())
         print(f"  -> {slot_report}")
-        r = subprocess.run(
+        r = run_stage(
             [sys.executable,
              str(SCRIPTS_ROOT / "deck" / "build_pptx_from_layout.py"),
              "--layout", str(combined_path),
              "--assets-root", str(work),
-             "--out", str(pptx_path)],
-            check=True, capture_output=True, text=True,
-        )
+             "--out", str(pptx_path)])
         if r.stdout.strip():
             print(r.stdout.strip())
         print(f"  -> {pptx_path}")
@@ -503,12 +505,10 @@ def main() -> int:
     # ---- Stage 4: inspect_pptx ----
     banner("4/5  inspect_pptx")
     ts = time.time()
-    r = subprocess.run(
+    r = run_stage(
         [sys.executable, str(SCRIPTS_ROOT / "verify" / "inspect_pptx.py"),
          "--pptx", str(pptx_path),
-         "--report", str(qa_path)],
-        check=True, capture_output=True, text=True,
-    )
+         "--report", str(qa_path)])
     print(r.stdout.strip())
     print(f"  stage 4 done in {time.time() - ts:.1f}s", flush=True)
     try:
@@ -537,12 +537,10 @@ def main() -> int:
         try:
             # render_preview writes <out-dir>/previews/page-NN.png,
             # so we point --out-dir at <work> to land at <work>/previews/.
-            r = subprocess.run(
+            r = run_stage(
                 [sys.executable, str(SCRIPTS_ROOT / "verify" / "render_preview.py"),
                  "--pptx", str(pptx_path),
-                 "--out-dir", str(work)],
-                check=True, capture_output=True, text=True,
-            )
+                 "--out-dir", str(work)])
             if r.stdout.strip():
                 print(r.stdout.strip())
         except subprocess.CalledProcessError as exc:

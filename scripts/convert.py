@@ -225,7 +225,11 @@ def main() -> int:
         "--work-dir", str(work),
         "--table-score-threshold", str(args.table_score_threshold),
     ]
-    if args.pages:
+    if args.pages and not pdf_mode:
+        # In PDF mode pdf_ingest already selected the requested pages AND
+        # renumbered them sequentially (page_01, page_02, ...), so
+        # re-filtering build_deck on the original numbers would look for
+        # pages that no longer exist.
         build_cmd += ["--pages", args.pages]
     if args.detect_tables:
         build_cmd.append("--detect-tables")
